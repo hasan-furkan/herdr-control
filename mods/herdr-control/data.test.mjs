@@ -3,6 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 
 let localCatalogAvailable = false;
@@ -74,7 +75,7 @@ registerHooks({
           export const agents = () => read("agents", [{ title: "PRIVATE_AGENT" }]);
           export const panes = () => read("panes", [{ title: "PRIVATE_PANE" }]);
           export const terminals = () => read("terminals", [{ name: "PRIVATE_TERMINAL" }]);
-          export const focused = () => read("focused", { terminal: "PRIVATE_ADDRESS" });
+          export const focused = () => read("focused", state.get("test.focused") ?? { terminal: "PRIVATE_ADDRESS" });
           export const keys = () => read("keys", []);
           export const commands = () => read("commands", []);
           export const props = () => ({});
@@ -139,8 +140,11 @@ const { getDemoData, DEMO_KEY, TOGGLE_DEMO_COMMAND } = await import("./demo.js")
 const { isDemo, setDemo } = await import("./demo-mode.js");
 const { readDashboard } = await import("./source.js");
 const { default: HerdrControl } = await import("./main.js");
+const { inControlLayout, jump } = await import("./nav.js");
 const { default: Tabs } = await import("../herdr-control-tabs/main.js");
 const { default: Phrases } = await import("../herdr-control-phrases/main.js");
+const controlLayout = JSON.parse(readFileSync(new URL("../../layouts/herdr-control.json", import.meta.url), "utf8"));
+const panelNode = JSON.parse(readFileSync(new URL("../../layouts/snippets/herdr-control-panel.json", import.meta.url), "utf8"));
 
 test("demo fixtures survive collector validation and exercise the dashboard view models", () => {
   const now = new Date();
@@ -196,7 +200,80 @@ function renderedText(element) {
   return [...(element?.labels ?? []), ...(element?.content ?? []).map(renderedText)].join("\n");
 }
 
-test("screenshot commands drive the layout and full tab in live and demo modes", async () => {
+function renderedElement(element, id) {
+  if (element?.elementId === id) return element;
+  for (const child of element?.content ?? []) {
+    const match = renderedElement(child, id);
+    if (match) return match;
+  }
+  return null;
+}
+
+test("full-layout navigation requires the control stack even when the layout name matches", () => {
+  const terminal = { terminal: "t1" };
+  try {
+    state.set("layout", "renamed-control");
+    state.set("test.layout", controlLayout);
+    assert.equal(inControlLayout(), true);
+    jump("agent.focus", terminal);
+    assert.deepEqual(calls.splice(0), [
+      ["agent.focus", terminal],
+      ["layout.select", { stack: "work-stack", child: "terminal" }],
+    ]);
+
+    state.set("layout", "herdr-control");
+    state.set("test.layout", { type: "row", children: [{ id: "work-stack", type: "stack" }, panelNode] });
+    assert.equal(inControlLayout(), false);
+    jump("agent.focus", terminal);
+    assert.deepEqual(calls, [["agent.focus", terminal]]);
+  } finally {
+    state.clear();
+    calls.length = 0;
+  }
+});
+
+test("the installed panel renders its own dashboard without a terminal return control", () => {
+  state.set("test.layout", { type: "row", children: [panelNode] });
+  setDemo(true);
+  const cx = { spawn() {}, notify() {}, timer: { every() {} } };
+  try {
+    const panel = new HerdrControl();
+    panel.init(panelNode.content.props, cx);
+    assert.equal(panel.currentScreen(), "overview");
+    for (const width of [null, panelNode.min, panelNode.size.px]) {
+      panel.width = width;
+      const view = renderedText(panel.render(cx));
+      assert.match(view, /Overview · Herdr Control/);
+      assert.match(view, /DEMO DATA/);
+      assert.doesNotMatch(view, /Back to terminal/);
+    }
+    renderedElement(panel.render(cx), "nav-agents").actions.on_click(null, cx);
+    assert.equal(panel.currentScreen(), "agents");
+    const table = renderedElement(panel.render(cx), "agents-sessions-scroll");
+    assert.match(renderedText(table), /Duration/);
+    assert.deepEqual(calls, []);
+  } finally {
+    state.clear();
+    calls.length = 0;
+  }
+});
+
+test("a dashboard tab hides the terminal return control when no terminal is focused", () => {
+  const cx = { spawn() {}, notify() {}, timer: { every() {} } };
+  try {
+    state.set("test.focused", { terminal: null });
+    const tab = new HerdrControl();
+    tab.init({}, cx);
+    assert.doesNotMatch(renderedText(tab.render(cx)), /Back to terminal/);
+    state.set("test.focused", { terminal: "t1" });
+    assert.match(renderedText(tab.render(cx)), /Back to terminal/);
+  } finally {
+    state.clear();
+    hostReads.length = 0;
+  }
+});
+
+test("screenshot commands drive the layout, panel and tab in live and demo modes", async () => {
   const routes = [
     ["goto-overview", "overview"], ["goto-spaces", "spaces"],
     ["goto-machines", "machines"], ["goto-ports", "ports"],
@@ -205,17 +282,25 @@ test("screenshot commands drive the layout and full tab in live and demo modes",
   ];
 
   try {
-    for (const part of ["nav", null]) {
+    for (const part of ["nav", "panel", null]) {
       for (const demo of [false, true]) {
         state.clear();
         calls.length = 0;
         commandWaiters.length = 0;
-        if (part === "nav") state.set("layout", "herdr-control");
+        if (part === "nav") {
+          state.set("layout", "herdr-control");
+          state.set("test.layout", controlLayout);
+        } else if (part === "panel") {
+          state.set("test.layout", { type: "row", children: [panelNode] });
+        }
         setDemo(demo);
         const tasks = [];
         const cx = { spawn: (task) => tasks.push(task), notify() {}, timer: { every() {} } };
         const owner = new HerdrControl();
         owner.init({ part }, cx);
+        if (part === "panel" && !demo) {
+          assert.equal(tasks.length, 2, "the panel schedules collection and listens for commands");
+        }
         tasks.at(-1)(cx);
         async function send(command) {
           commandWaiters.shift()(command);
@@ -231,6 +316,8 @@ test("screenshot commands drive the layout and full tab in live and demo modes",
           if (part === "nav") {
             assert.equal(state.get("herdr-control.view"), "screen");
             assert.deepEqual(calls.at(-1), ["layout.select", { stack: "work-stack", child: "screen" }]);
+          } else {
+            assert.deepEqual(calls, []);
           }
         }
 

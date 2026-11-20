@@ -12,12 +12,20 @@ export const MACHINE_KEY = "herdr-control.machine";
 
 /** True when the herdr-control layout (nav sidebar + work stack) is shown. */
 export function inControlLayout() {
-  if (shared("layout") === "herdr-control") return true;
+  return controlStack() !== null;
+}
+
+function controlStack() {
   const root = layout();
   const sidebar = findNode(root, "sidebar")?.content;
-  const screen = findNode(findNode(root, STACK), "screen")?.content;
-  return sidebar?.mod === "herdr-control" && sidebar?.props?.part === "nav"
-    && screen?.mod === "herdr-control" && screen?.props?.part === "content";
+  const stack = findNode(root, STACK);
+  if (sidebar?.mod !== "herdr-control" || sidebar?.props?.part !== "nav"
+    || stack?.type !== "stack" || !Array.isArray(stack.children)) return null;
+
+  const screen = stack.children.find((node) => node?.id === "screen")?.content;
+  if (screen?.mod !== "herdr-control" || screen?.props?.part !== "content"
+    || !stack.children.some((node) => node?.id === "terminal")) return null;
+  return stack;
 }
 
 export function showView(view) {
@@ -54,6 +62,5 @@ export function currentView() {
 
 /** The stack child the herdr-control layout file starts on. */
 export function startView() {
-  const active = inControlLayout() ? findNode(layout(), STACK)?.active : null;
-  return active === "terminal" ? "terminal" : "screen";
+  return controlStack()?.active === "terminal" ? "terminal" : "screen";
 }

@@ -9,6 +9,7 @@ Live mode draws from Herdr, collector results, and supported commands. Show "—
 - Mod folder: `mods/herdr-control/` (linked as `~/.config/herdr-app/mods/herdr-control`; every save reloads it). `mods/herdr-control/mod.json`: `{ "place": "none" }`.
 - Install `mods/herdr-control-tabs/`, `mods/herdr-control-tools/`, and `mods/herdr-control-phrases/` under `mods/` as `herdr-control-tabs`, `herdr-control-tools`, and `herdr-control-phrases`, respectively. Set `HERDR_CONTROL_PHRASES_FILE` in the app's environment to the path of a readable Markdown file for the phrases overlay.
 - Full tab: `herdr-app do tab.new '{"mod":"herdr-control","name":"Herdr Control","props":{"screen":"overview"}}'`. `props().screen` picks the first screen and wins over `localStorage`. Screen ids: `overview`, `spaces`, `machines`, `ports`, `agents`, `approvals`. Agents sub-tab: `props().agentsTab` = `now` | `usage` | `catalog`. Close tabs you opened when done.
+- Standalone panel: use `layouts/snippets/herdr-control-panel.json` in a personal layout. `props().part = "panel"` gives the block its own dashboard navigation and omits **Back to terminal**. Herdr's own terminal and tab commands handle jumps in the surrounding layout.
 - Files:
   - `mods/herdr-control/main.js` — root view, shell (sidebar + top bar), routing.
   - `mods/herdr-control/palette.js` — the Mono palette (see Colors). The only place a color value may be written.
@@ -158,7 +159,7 @@ Every screen follows its design's layout (grid, card order, sizes). Each card ha
 
 ## Screenshot commands
 
-With the Herdr Control layout or a full dashboard tab visible, run `herdr-app do herdr-control.<command>`. The commands work with live data and demo data. For example, `herdr-app do herdr-control.goto-machines` opens Machines.
+With the Herdr Control layout, standalone panel, or dashboard tab visible, run `herdr-app do herdr-control.<command>`. The commands work with live data and demo data. For example, `herdr-app do herdr-control.goto-machines` opens Machines.
 
 | Command | Effect |
 | --- | --- |
@@ -176,7 +177,7 @@ With the Herdr Control layout or a full dashboard tab visible, run `herdr-app do
 - Without `part` the mod is the full tab with sidebar and top bar.
 - Ctrl+Shift+H: `layout.switch {name: "herdr-control"}`.
 - Tab bar: `herdr-control-tabs`, a clone of Herdr's `tabs` mod (`mods/herdr-control-tabs/`); its `toTerminal()` brings the terminal view to the front. After a Herdr update, re-clone `tabs` and re-apply `toTerminal()`.
-- The collector runs only in one mod copy: the nav part (or the full tab when there is no layout); others read it through `shared("herdr-control.collect")`.
+- The nav part runs the collector in the full layout. Outside it, a standalone panel or full tab can run collection. The other layout parts read results through `shared("herdr-control.collect")`.
 
 ## Done means
 

@@ -305,6 +305,7 @@ export function renderAgents({
   terminalsList,
   panesList,
   narrow,
+  embeddedPanel,
 }) {
   const activeTab = AGENTS_TABS.includes(agentsTab) ? agentsTab : "now";
   const helpers = buildHelpers(prices);
@@ -351,6 +352,7 @@ export function renderAgents({
       panesList: panesList ?? [],
       helpers,
       narrow,
+      embeddedPanel,
     });
   }
 

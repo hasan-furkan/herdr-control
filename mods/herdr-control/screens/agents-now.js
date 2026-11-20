@@ -31,6 +31,7 @@ function buildHeroSection({
   bgLiveList,
   helpers,
   narrow,
+  embeddedPanel,
 }) {
   const { PALETTE, SIZES, RADII, monoFont } = palette;
   const list = agentsList ?? [];
@@ -466,6 +467,7 @@ function buildHeroSection({
       );
   });
 
+  const table = v_flex().w_full().gap(4).child(tableHeader).children(tableRows);
   const sessionsPanel = v_flex()
     .flex_1()
     .min_w(0)
@@ -501,11 +503,9 @@ function buildHeroSection({
                 .text_center()
                 .child("Claude, OpenCode, Codex, and Antigravity appear here when started in a terminal."),
             )
-        : v_flex()
-            .w_full()
-            .gap(4)
-            .child(tableHeader)
-            .children(tableRows),
+        : embeddedPanel
+          ? div().id("agents-sessions-scroll").w_full().overflow_x_scrollbar().child(table.min_w(624))
+          : table,
     );
 
   return ui.heroCard({
@@ -1122,6 +1122,7 @@ export function renderAgentsNow({
   panesList,
   helpers,
   narrow,
+  embeddedPanel,
 }) {
   const bgLiveList = data.dedupeBackgroundLive({
     collectEntries,
@@ -1161,6 +1162,7 @@ export function renderAgentsNow({
         bgLiveList,
         helpers,
         narrow,
+        embeddedPanel,
       }),
     )
     .child(row2)

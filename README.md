@@ -15,7 +15,13 @@
 
 ## Install with your agent
 
-> Read ~/.config/herdr-app/AGENTS.md, then add this layout: https://github.com/hasan-furkan/herdr-control. Follow its RECIPE.md.
+**Option A — Layout**
+
+> Read `~/.config/herdr-app/AGENTS.md`, then add this layout: https://github.com/hasan-furkan/herdr-control. Follow Option A in its `RECIPE.md`.
+
+**Option B — Mod only**
+
+> Read `~/.config/herdr-app/AGENTS.md`, then add the Herdr Control mod to my current layout: https://github.com/hasan-furkan/herdr-control. Follow Option B in its `RECIPE.md`.
 
 See [RECIPE.md](RECIPE.md) for install, update, and uninstall steps.
 
@@ -53,9 +59,11 @@ See [RECIPE.md](RECIPE.md) for install, update, and uninstall steps.
 
 ## Install
 
+### Option A: Layout
+
 Run the commands from this project's root for a fresh installation. The links point to this checkout, so keep it in place after installation. If the layout name already exists, copy the JSON to an unused filename and use that name when switching layouts. See [RECIPE.md](RECIPE.md) if any of the four mod folders are already installed.
 
-### Windows (PowerShell)
+#### Windows (PowerShell)
 
 Create directory junctions with `New-Item -ItemType Junction`. Command Prompt's `mklink /J` creates the same kind of link.
 
@@ -83,7 +91,7 @@ foreach ($name in $modNames) {
 Copy-Item -LiteralPath (Join-Path $project 'layouts/herdr-control.json') -Destination (Join-Path $layouts "$layoutName.json")
 ```
 
-### macOS and Linux
+#### macOS and Linux
 
 ```sh
 config="$HOME/.config/herdr-app"
@@ -110,7 +118,7 @@ layout_name=herdr-control
 )
 ```
 
-### Switch layouts
+#### Switch layouts
 
 With Herdr running, cycle to `herdr-control` with Ctrl+Shift+L, or run the following in a POSIX shell or PowerShell 7.3+ with standard native argument passing.
 
@@ -119,6 +127,18 @@ herdr-app do layout.switch '{"name":"herdr-control"}'
 ```
 
 In Windows Command Prompt, use `herdr-app do layout.switch "{\"name\":\"herdr-control\"}"`. The layout opens on Overview. Use **Back to terminal** or click a terminal tab to return to the terminal view.
+
+### Option B: Mod only
+
+1. Copy only `mods/herdr-control` into `~/.config/herdr-app/mods/` for a fresh install.
+2. Back up your current personal layout JSON. Add [the panel block](layouts/snippets/herdr-control-panel.json) to an existing `row`'s `children`, to the left or right of your terminal area. If you already have a `herdr-control` block, update its `content.props.part` to `panel` and keep its ID and placement. Duplicate a shipped layout in Herdr before editing it.
+3. To show or hide the panel, run `herdr-app do layout.toggle --id herdr-control-panel`, using your node's ID if it differs. The recipe includes an optional keyboard shortcut.
+
+To open the dashboard on demand in a tab, install the mod folder and run the command below. This also works with a shipped layout.
+
+```sh
+herdr-app do tab.new --mod herdr-control --name "Herdr Control"
+```
 
 ## Configuration
 

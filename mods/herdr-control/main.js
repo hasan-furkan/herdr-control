@@ -190,6 +190,7 @@ export default class HerdrControl extends View {
     }
 
     this.gotoMode = false;
+    this.embeddedPanel = p.part === "panel";
     const requested = p?.screen;
     if (SCREENS.includes(requested)) {
       this.screen = requested;
@@ -227,7 +228,7 @@ export default class HerdrControl extends View {
     this.navTerminalError = null;
     this.dockerLogError = null;
 
-    // part: "nav" (sidebar), "content" (top bar + screen), "aside" (terminal right rail), or null (full tab).
+    // The panel and full tab both own their dashboard navigation and use the same collector path.
     this.part =
       p?.part === "nav" || p?.part === "content" || p?.part === "aside" ? p.part : null;
     if (this.part === "nav") {
@@ -397,7 +398,7 @@ export default class HerdrControl extends View {
   }
 
   returnToTerminal() {
-    if (isDemo()) return;
+    if (isDemo() || this.embeddedPanel) return;
     if (this.part === "nav" || inControlLayout()) {
       showView("terminal");
       return;
@@ -1014,6 +1015,8 @@ export default class HerdrControl extends View {
 
   renderNav(summary, narrow, live = {}) {
     const streaming = isStreaming();
+    const showReturn = !this.embeddedPanel
+      && (this.part === "nav" || inControlLayout() || Boolean(live.focusedInfo?.terminal));
     const { usageCollapsed, tailnetCompact } = dataModule.sidebarLayout(this.height ?? viewportHeight());
     const usageRows = dataModule.buildUsageRows(live.collectEntries ?? [], dashboardNow());
     const userHostText = summary.hostname ? maskUser(summary.userLine) : "—";
@@ -1157,7 +1160,7 @@ export default class HerdrControl extends View {
                     .child(streaming ? "Stream" : "Hide"),
                 ),
             )
-            .child(
+            .when(showReturn, (el) => el.child(
               h_flex()
                 .id("return-terminal-narrow")
                 .w_full()
@@ -1173,7 +1176,7 @@ export default class HerdrControl extends View {
                 .hover((s) => s.bg(PALETTE.raisedHover).border_color(PALETTE.accent))
                 .on_click(() => this.returnToTerminal())
                 .child(iconOf("terminals", 16, PALETTE.text)),
-            ),
+            )),
         );
     }
 
@@ -1188,7 +1191,7 @@ export default class HerdrControl extends View {
       .px(10)
       .py(14)
       // macOS draws its traffic lights over a titlebar-less layout; keep the header below them.
-      .when(trafficLightsOverNav(), (el) => el.pt(38))
+      .when(!this.embeddedPanel && trafficLightsOverNav(), (el) => el.pt(38))
       .gap(10)
       .child(
         v_flex()
@@ -1348,11 +1351,11 @@ export default class HerdrControl extends View {
                   ),
               ),
           )
-          .child(this.renderNavTailnet(summary, tailnetCompact)),
+          .child(this.renderNavTailnet(summary, tailnetCompact, showReturn)),
       );
   }
 
-  renderNavTailnet(summary, compact) {
+  renderNavTailnet(summary, compact, showReturn) {
     const tailnetLabel = summary.tailnetName ? `Tailnet · ${maskTailnet(summary.tailnetName)}` : "Tailnet · —";
     const pingLabel = summary.pingMs !== null ? `${summary.pingMs} ms` : "—";
     const terminalCount = dataModule.countLabel(summary.liveTerminals, "terminal");
@@ -1365,8 +1368,7 @@ export default class HerdrControl extends View {
     const name = div().flex_1().min_w(0).truncate().text_size(SIZES.xs)
       .font_semibold().text_color(PALETTE.text).child(tailnetLabel);
     const terminalIcon = iconOf("terminals", 14, PALETTE.text);
-    const returnButton = h_flex()
-      .id("return-terminal")
+    const footer = h_flex()
       .w_full()
       .h(34)
       .px(10)
@@ -1376,14 +1378,16 @@ export default class HerdrControl extends View {
       .border(1)
       .border_color(PALETTE.lineStrong)
       .items_center()
-      .cursor_pointer()
-      .hover((s) => s.bg(PALETTE.raisedHover).border_color(PALETTE.accent))
-      .on_click(() => this.returnToTerminal());
+      .id(showReturn ? "return-terminal" : "tailnet-summary")
+      .when(showReturn, (el) => el
+        .cursor_pointer()
+        .hover((s) => s.bg(PALETTE.raisedHover).border_color(PALETTE.accent))
+        .on_click(() => this.returnToTerminal()));
     if (compact) {
-      const tooltip = [tailnetLabel, `${pingLabel} · ${terminalCount}`, funnel, stale, error, "Back to terminal"]
-        .filter(Boolean).join("\n");
-      return returnButton.role("button").accessibility_label("Back to terminal").tooltip(tooltip)
-        .child(dot).child(name).child(terminalIcon);
+      const details = [tailnetLabel, `${pingLabel} · ${terminalCount}`, funnel, stale, error];
+      if (showReturn) details.push("Back to terminal");
+      return footer.tooltip(details.filter(Boolean).join("\n")).child(dot).child(name)
+        .when(showReturn, (el) => el.role("button").accessibility_label("Back to terminal").child(terminalIcon));
     }
 
     const detail = (text, color) => div().w_full().truncate().text_size(SIZES.xs).text_color(color).child(text);
@@ -1409,12 +1413,12 @@ export default class HerdrControl extends View {
       .when(funnel, (el) => el.child(detail(funnel, PALETTE.mono).font_family(monoFont())))
       .when(stale, (el) => el.child(detail(stale, PALETTE.warn).font_semibold()))
       .when(error, (el) => el.child(detail(error, PALETTE.warn)))
-      .child(
-        returnButton.child(terminalIcon).child(
+      .when(showReturn, (el) => el.child(
+        footer.child(terminalIcon).child(
           div().flex_1().min_w(0).truncate().text_size(SIZES.xs)
             .font_bold().text_color(PALETTE.text).child("Back to terminal"),
         ),
-      );
+      ));
   }
 
   renderTopBar(summary, narrow) {
@@ -1673,6 +1677,7 @@ export default class HerdrControl extends View {
           terminalsList: live.terminalsList,
           panesList: live.panesList,
           narrow,
+          embeddedPanel: this.embeddedPanel,
         });
       case "machines": {
         const selectionKey = live.demo ? DEMO_MACHINE_KEY : MACHINE_KEY;
@@ -1846,8 +1851,8 @@ export default class HerdrControl extends View {
       if (!stillOpen) this.confirmingTabClose = null;
     }
 
-    const narrow = this.width !== null && this.width < 900;
-    const navData = { spacesList, panesList, collectEntries };
+    const narrow = this.embeddedPanel || (this.width !== null && this.width < 900);
+    const navData = { spacesList, panesList, collectEntries, focusedInfo: live.focusedInfo };
     const trackSize = (size, sizeCx) => {
       const width = Math.round(size.width);
       if (this.width !== width || this.height !== size.height) {

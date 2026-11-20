@@ -1,0 +1,11 @@
+{
+  "id": "herdr-control-panel",
+  "type": "block",
+  "size": { "px": 720 },
+  "min": 600,
+  "background": "canvas",
+  "content": {
+    "mod": "herdr-control",
+    "props": { "part": "panel" }
+  }
+}
