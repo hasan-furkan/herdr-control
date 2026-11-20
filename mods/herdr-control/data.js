@@ -316,6 +316,47 @@ export function sidebarLayout(height) {
   };
 }
 
+export const SIDEBAR_TERMINAL_METRICS = {
+  headerHeight: 18,
+  tabHeight: 26,
+  tabGap: 2,
+  groupGap: 4,
+  moreHeight: 22,
+};
+
+export function sidebarListBudget({ height, headerHeight, footerHeight, controlsHeight, insetHeight, minListHeight }) {
+  const measured = [height, headerHeight, footerHeight].every(Number.isFinite);
+  const remaining = measured ? height - headerHeight - footerHeight - controlsHeight - insetHeight : minListHeight;
+  return { listHeight: Math.max(minListHeight, remaining), scroll: remaining < minListHeight };
+}
+
+export function sidebarTerminalPreview(spaces, height) {
+  const { headerHeight, tabHeight, tabGap, groupGap, moreHeight } = SIDEBAR_TERMINAL_METRICS;
+  const available = Number.isFinite(height) ? height : moreHeight;
+  const tabPitch = tabHeight + tabGap;
+  const groups = (spaces ?? []).filter((space) => space?.tabs?.length)
+    .map((space) => ({ space, tabs: space.tabs }));
+  const totalTabs = groups.reduce((sum, { tabs }) => sum + tabs.length, 0);
+  const fullHeight = groups.length * headerHeight + totalTabs * tabPitch
+    + Math.max(0, groups.length - 1) * groupGap;
+  if (fullHeight <= available) return { groups, totalTabs, hiddenTabs: 0 };
+
+  const visible = [];
+  let hiddenTabs = totalTabs;
+  let remaining = available - moreHeight;
+  // Reserve the trailing gap before the next group or the overflow button.
+  const groupOverhead = headerHeight + groupGap;
+  for (const { space, tabs } of groups) {
+    const count = Math.min(tabs.length, Math.floor((remaining - groupOverhead) / tabPitch));
+    if (count < 1) break;
+    visible.push({ space, tabs: tabs.slice(0, count) });
+    hiddenTabs -= count;
+    remaining -= groupOverhead + count * tabPitch;
+    if (count < tabs.length) break;
+  }
+  return { groups: visible, totalTabs, hiddenTabs };
+}
+
 export function statusLabel(status) {
   return STATUS_LABELS[status] ?? (status || "—");
 }

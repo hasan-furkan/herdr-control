@@ -30,7 +30,7 @@ registerHooks({
         source: `
           export class View {}
           function element() {
-            const result = { content: [], actions: {}, labels: [] };
+            const result = { content: [], actions: {}, labels: [], layout: {} };
             const proxy = new Proxy(result, {
               get(target, name) {
                 if (name in target) return target[name];
@@ -40,6 +40,8 @@ registerHooks({
                   if (name === "children") target.content.push(...args[0]);
                   if (name === "when" && args[0]) args[1](proxy);
                   if (name === "id") target.elementId = args[0];
+                  if (name === "h") target.layout.height = args[0];
+                  if (name === "overflow_y_scrollbar") target.layout.scrollY = true;
                   if ((name === "tooltip" || name === "accessibility_label") && typeof args[0] === "string") {
                     target.labels.push(args[0]);
                   }
@@ -124,6 +126,8 @@ const {
   summarizeUsageTokens,
   INVALID_COLLECTOR_RESULT,
   sidebarLayout,
+  sidebarListBudget,
+  sidebarTerminalPreview,
   summarizeUsageCard,
   tailscaleRoutes,
   validateCollectorResult,
@@ -270,6 +274,66 @@ test("a dashboard tab hides the terminal return control when no terminal is focu
   } finally {
     state.clear();
     hostReads.length = 0;
+  }
+});
+
+test("the demo sidebar reserves space for its bottom cards before fitting terminal rows", () => {
+  const cx = { spawn() {}, notify() {}, timer: { every() {} } };
+  state.set("test.layout", controlLayout);
+  setDemo(true);
+  try {
+    const nav = new HerdrControl();
+    nav.init({ part: "nav" }, cx);
+
+    // Header and footer sizes come from the demo screenshots and the collapsed variants.
+    for (const [height, footerHeight, collapsed, listHeight, hidden, scroll] of [
+      [1152, 541, false, 192, 1, false],
+      [824, 255, true, 150, 2, false],
+      [824, 232, undefined, 173, 2, false],
+      [700, 255, true, 26, 5, false],
+      [699, 158, true, 122, 3, false],
+      [650, 158, true, 73, 4, false],
+      [599, 158, true, 22, 5, false],
+      [598, 158, true, 22, 5, true],
+      [1200, 541, false, 240, 0, false],
+    ]) {
+      state.set("herdr-control.usageCollapsed", collapsed);
+      let view = nav.render(cx);
+      view.actions.on_size_change({ width: 232, height }, cx);
+      view = nav.render(cx);
+      renderedElement(view, "nav-header").actions.on_size_change({ width: 212, height: 304 }, cx);
+      renderedElement(view, "nav-footer").actions.on_size_change({ width: 212, height: footerHeight }, cx);
+      view = nav.render(cx);
+
+      const preview = renderedElement(view, "nav-terminals-preview");
+      assert.equal(preview.layout.height, listHeight);
+      assert.equal(preview.actions.on_size_change, undefined);
+      assert.equal(Boolean(renderedElement(view, "nav").layout.scrollY), scroll);
+      assert.equal(Boolean(renderedElement(view, "sidebar-usage-claude")), collapsed === false);
+      assert.ok(renderedElement(view, "sidebar-usage"));
+      assert.ok(renderedElement(view, "stream-switch-row"));
+      assert.equal(Boolean(renderedElement(view, "tailnet-card")), height >= 700);
+      const back = renderedElement(view, "return-terminal");
+      assert.ok(back.actions.on_click);
+      assert.ok(height >= 700 ? renderedText(back).includes("Back to terminal") : back.labels.includes("Back to terminal"));
+      assert.equal(Boolean(renderedElement(view, "nav-tab-build-server/demo-api-tab-1")), hidden < 5);
+      assert.equal(Boolean(renderedElement(view, "nav-tab-workstation/demo-web-app-tab-2")), hidden < 2);
+      assert.equal(Boolean(renderedElement(view, "nav-space-demo-docs")), hidden === 0);
+      assert.equal(Boolean(renderedElement(view, "nav-tab-demo-docs-tab-1")), hidden === 0);
+
+      const more = renderedElement(view, "nav-terminals-more");
+      if (hidden) {
+        assert.ok(more);
+        assert.ok(more.content.includes(`+ ${hidden} more`));
+        more.actions.on_click(null, cx);
+        assert.equal(nav.currentScreen(), "spaces");
+      } else {
+        assert.equal(more, null);
+      }
+    }
+  } finally {
+    state.clear();
+    calls.length = 0;
   }
 });
 
@@ -646,6 +710,60 @@ test("sidebar switches to single-line cards at the short-height boundaries", () 
   for (const height of [1, 699.5, 0, -1, null, undefined, NaN, Infinity]) {
     assert.deepEqual(sidebarLayout(height), { usageCollapsed: true, tailnetCompact: true });
   }
+});
+
+test("sidebar list budget subtracts fixed sections and only scrolls below the minimum", () => {
+  const sections = { headerHeight: 304, controlsHeight: 67, insetHeight: 48, minListHeight: 22 };
+  for (const [height, footerHeight, listHeight, scroll] of [
+    [1152, 541, 192, false],
+    [824, 255, 150, false],
+    [824, 232, 173, false],
+    [699, 158, 122, false],
+    [599, 158, 22, false],
+    [598, 158, 22, true],
+    [824, null, 22, false],
+  ]) {
+    assert.deepEqual(sidebarListBudget({ ...sections, height, footerHeight }), { listHeight, scroll });
+  }
+  assert.deepEqual(
+    sidebarListBudget({ ...sections, height: 824, footerHeight: 255, controlsHeight: 101, insetHeight: 72 }),
+    { listHeight: 92, scroll: false },
+  );
+});
+
+test("the terminal preview budgets each header with a tab and reserves a row for overflow", () => {
+  const { spacesList } = getDemoData(new Date());
+  for (const [height, expectedTabs, expectedHidden] of [
+    [null, [], 5],
+    [22, [], 5],
+    [71.9, [], 5],
+    [72, [1], 4],
+    [99.9, [1], 4],
+    [100, [2], 3],
+    [149.9, [2], 3],
+    [150, [2, 1], 2],
+    [177.9, [2, 1], 2],
+    [178, [2, 2], 1],
+    [201.9, [2, 2], 1],
+    [202, [2, 2, 1], 0],
+  ]) {
+    const { groups, totalTabs, hiddenTabs } = sidebarTerminalPreview(spacesList, height);
+    assert.deepEqual(groups.map(({ tabs }) => tabs.length), expectedTabs);
+    assert.deepEqual(groups.map(({ space }) => space.id), spacesList.slice(0, expectedTabs.length).map(({ id }) => id));
+    assert.equal(totalTabs, 5);
+    assert.equal(hiddenTabs, expectedHidden);
+  }
+});
+
+test("empty spaces do not consume rows in the terminal preview", () => {
+  const empty = { id: "empty", tabs: [] };
+  const space = { id: "with-tab", tabs: [{ id: "tab" }] };
+  assert.deepEqual(sidebarTerminalPreview([empty, {}, space], 104), {
+    groups: [{ space, tabs: space.tabs }],
+    totalTabs: 1,
+    hiddenTabs: 0,
+  });
+  assert.deepEqual(sidebarTerminalPreview([empty], 192), { groups: [], totalTabs: 0, hiddenTabs: 0 });
 });
 
 test("collapsed usage highlights the lowest five-hour quota or falls back to token activity", () => {

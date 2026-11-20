@@ -71,7 +71,14 @@ const STREAM_STORAGE_KEY = "herdr-control.stream";
 const USAGE_COLLAPSED_KEY = "herdr-control.usageCollapsed";
 const DEMO_MACHINE_KEY = "herdr-control.demoMachine";
 const LEGACY_STATUS_KEY = "herdr-control.demoHiddenStatus";
-const NAV_TAB_HEIGHT = 26;
+const NAV_TERMINAL_CONTROLS = {
+  topPadding: 10,
+  borderWidth: 1,
+  gap: 6,
+  headingHeight: 20,
+  buttonHeight: 24,
+  errorHeight: 28,
+};
 
 function renderSidebarUsage(rows, narrow, autoCollapsed) {
   const collapsed = shared(USAGE_COLLAPSED_KEY);
@@ -219,6 +226,7 @@ export default class HerdrControl extends View {
     this.catalog = CATALOG;
     this.width = null;
     this.height = null;
+    this.navHeights = { header: null, footer: null };
     this.blockedSince = new Map();
     this.confirmingApproval = null;
     this.sendingApproval = null;
@@ -809,21 +817,16 @@ export default class HerdrControl extends View {
       .child(String(item.badge));
   }
 
-  renderNavTerminals(spacesList, panesList) {
+  renderNavTerminals(spacesList, panesList, listHeight, error) {
     const spacesAll = spacesList ?? [];
     const panesAll = panesList ?? [];
     const activeSpace = spacesAll.find((s) => s && s.active) ?? spacesAll[0] ?? null;
-    const totalTabs = spacesAll.reduce((sum, sp) => sum + (sp?.tabs?.length ?? 0), 0);
-    const error = !isDemo() && this.navTerminalError ? maskError(this.navTerminalError) : null;
-    const topPadding = 10;
-    const borderWidth = 1;
-    const gap = 6;
-    const headingHeight = 20;
-    const buttonHeight = 24;
-    const errorHeight = 28;
-    const listMinHeight = 3 * NAV_TAB_HEIGHT;
-    const controlsHeight = headingHeight + buttonHeight + 2 * gap
-      + (error ? errorHeight + gap : 0);
+    const { headerHeight, tabHeight, tabGap, groupGap, moreHeight } =
+      dataModule.SIDEBAR_TERMINAL_METRICS;
+    const { groups, totalTabs, hiddenTabs } = dataModule.sidebarTerminalPreview(
+      spacesAll, listHeight,
+    );
+    const { topPadding, borderWidth, gap, headingHeight, buttonHeight, errorHeight } = NAV_TERMINAL_CONTROLS;
 
     const smallBtn = (id, label, onClick) =>
       h_flex()
@@ -845,100 +848,109 @@ export default class HerdrControl extends View {
         .on_click(onClick)
         .child(label);
 
-    const listBody =
-      spacesAll.length === 0
-        ? div()
+    const listBody = v_flex()
+      .w_full()
+      .flex_none()
+      .gap(groupGap)
+      .when(totalTabs === 0, (el) => el.child(
+        h_flex().h(tabHeight).items_center().px(6).text_size(SIZES.xs)
+          .text_color(PALETTE.muted).child(spacesAll.length ? "No open terminals" : "No open spaces"),
+      ))
+      .children(
+        groups.map(({ space: sp, tabs }) => {
+          const spaceName = maskPath(sp.name || "—");
+          return v_flex()
+            .id(`nav-space-${sp.id}`)
             .w_full()
-            .px(6)
-            .py(6)
-            .text_size(SIZES.xs)
-            .text_color(PALETTE.muted)
-            .child("No open spaces")
-        : v_flex()
-            .w_full()
-            .gap(6)
+            .flex_none()
+            .gap(tabGap)
+            .child(
+              h_flex()
+                .w_full()
+                .h(headerHeight)
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap(4)
+                .px(4)
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(SIZES.xs)
+                    .font_bold()
+                    .text_color(sp.active ? PALETTE.text : PALETTE.muted)
+                    .child(spaceName),
+                )
+                .when(Boolean(sp.machine), (el) =>
+                  el.child(
+                    div()
+                      .flex_none()
+                      .max_w("55%")
+                      .truncate()
+                      .font_family(monoFont())
+                      .text_size(SIZES.xs)
+                      .text_color(PALETTE.muted)
+                      .child(maskHost(sp.machine)),
+                  ),
+                ),
+            )
             .children(
-              spacesAll.map((sp) => {
-                const spaceName = maskPath(sp.name || "—");
-                const tabs = sp.tabs ?? [];
-                return v_flex()
-                  .id(`nav-space-${sp.id}`)
-                  .w_full()
-                  .gap(2)
-                  .child(
-                    h_flex()
-                      .w_full()
-                      .items_center()
-                      .justify_between()
-                      .gap(4)
-                      .px(4)
-                      .child(
-                        div()
-                          .flex_1()
-                          .min_w(0)
-                          .truncate()
-                          .text_size(SIZES.xs)
-                          .font_bold()
-                          .text_color(sp.active ? PALETTE.text : PALETTE.muted)
-                          .child(spaceName),
-                      )
-                      .when(Boolean(sp.machine), (el) =>
-                        el.child(
-                          div()
-                            .flex_none()
-                            .font_family(monoFont())
-                            .text_size(SIZES.xs)
-                            .text_color(PALETTE.muted)
-                            .child(maskHost(sp.machine)),
-                        ),
-                      ),
-                  )
-                  .children(
-                    tabs.map((tab) => {
-                      const lead =
-                        panesAll.find((p) => p.tab === tab.id && p.program?.agent) ??
-                        panesAll.find((p) => p.tab === tab.id);
-                      const rawLabel = tab.named
-                        ? tab.name
-                        : lead?.program?.name || tab.name || "Terminal";
-                      const tabLabel = maskTitle(rawLabel);
-                      const isCurrent = Boolean(sp.active && tab.active);
+              tabs.map((tab) => {
+                const lead =
+                  panesAll.find((p) => p.tab === tab.id && p.program?.agent) ??
+                  panesAll.find((p) => p.tab === tab.id);
+                const rawLabel = tab.named
+                  ? tab.name
+                  : lead?.program?.name || tab.name || "Terminal";
+                const tabLabel = maskTitle(rawLabel);
+                const isCurrent = Boolean(sp.active && tab.active);
 
-                      return h_flex()
-                        .id(`nav-tab-${tab.id}`)
-                        .w_full()
-                        .h(NAV_TAB_HEIGHT)
-                        .px(8)
-                        .gap(7)
-                        .rounded(RADII.chip)
-                        .items_center()
-                        .cursor_pointer()
-                        .bg(isCurrent ? PALETTE.raised : PALETTE.transparent)
-                        .border(1)
-                        .border_color(isCurrent ? PALETTE.lineStrong : PALETTE.transparent)
-                        .hover((s) => s.bg(PALETTE.raisedHover).border_color(PALETTE.line))
-                        .on_click((_e, cx) => this.selectSpaceAndTab(sp.id, tab.id, cx))
-                        .child(uiModule.statusDot(tab.status ?? "idle", 7))
-                        .child(
-                          div()
-                            .flex_1()
-                            .min_w(0)
-                            .truncate()
-                            .text_size(SIZES.xs)
-                            .font_semibold()
-                            .text_color(isCurrent ? PALETTE.text : PALETTE.muted)
-                            .child(tabLabel),
-                        );
-                    }),
+                return h_flex()
+                  .id(`nav-tab-${tab.id}`)
+                  .w_full()
+                  .h(tabHeight)
+                  .flex_none()
+                  .px(8)
+                  .gap(7)
+                  .rounded(RADII.chip)
+                  .items_center()
+                  .cursor_pointer()
+                  .bg(isCurrent ? PALETTE.raised : PALETTE.transparent)
+                  .border(1)
+                  .border_color(isCurrent ? PALETTE.lineStrong : PALETTE.transparent)
+                  .hover((s) => s.bg(PALETTE.raisedHover).border_color(PALETTE.line))
+                  .on_click((_e, cx) => this.selectSpaceAndTab(sp.id, tab.id, cx))
+                  .child(uiModule.statusDot(tab.status ?? "idle", 7))
+                  .child(
+                    div()
+                      .flex_1()
+                      .min_w(0)
+                      .truncate()
+                      .text_size(SIZES.xs)
+                      .font_semibold()
+                      .text_color(isCurrent ? PALETTE.text : PALETTE.muted)
+                      .child(tabLabel),
                   );
               }),
             );
+        }),
+      )
+      .when(hiddenTabs > 0, (el) => el.child(
+        h_flex().id("nav-terminals-more").w_full().h(moreHeight).flex_none().px(8)
+          .rounded(RADII.chip).items_center().cursor_pointer().role("button")
+          .text_size(SIZES.xs).font_semibold().text_color(PALETTE.muted)
+          .hover((s) => s.bg(PALETTE.raisedHover).text_color(PALETTE.text))
+          .tooltip("Show terminals in Spaces")
+          .on_click((_e, cx) => this.selectScreen("spaces", cx))
+          .child(`+ ${hiddenTabs} more`),
+      ));
 
     return v_flex()
       .id("nav-terminals-section")
       .w_full()
-      .flex_1()
-      .min_h(topPadding + borderWidth + controlsHeight + listMinHeight)
+      .flex_none()
       .pt(topPadding)
       .border_t(borderWidth)
       .border_color(PALETTE.line)
@@ -1004,12 +1016,12 @@ export default class HerdrControl extends View {
       )
       .child(
         v_flex()
-          .id("nav-terminals-scroll")
+          .id("nav-terminals-preview")
           .w_full()
-          .flex_1()
-          .min_h(listMinHeight)
-          .overflow_y_scrollbar()
-          .child(listBody.flex_none()),
+          .h(listHeight)
+          .flex_none()
+          .overflow_hidden()
+          .child(listBody),
       );
   }
 
@@ -1017,7 +1029,8 @@ export default class HerdrControl extends View {
     const streaming = isStreaming();
     const showReturn = !this.embeddedPanel
       && (this.part === "nav" || inControlLayout() || Boolean(live.focusedInfo?.terminal));
-    const { usageCollapsed, tailnetCompact } = dataModule.sidebarLayout(this.height ?? viewportHeight());
+    const height = this.height ?? viewportHeight();
+    const { usageCollapsed, tailnetCompact } = dataModule.sidebarLayout(height);
     const usageRows = dataModule.buildUsageRows(live.collectEntries ?? [], dashboardNow());
     const userHostText = summary.hostname ? maskUser(summary.userLine) : "—";
 
@@ -1180,6 +1193,29 @@ export default class HerdrControl extends View {
         );
     }
 
+    // macOS draws its traffic lights over a titlebar-less layout; keep the header below them.
+    const topPadding = !this.embeddedPanel && trafficLightsOverNav() ? 38 : 14;
+    const bottomPadding = 14;
+    const navGap = 10;
+    const error = !isDemo() && this.navTerminalError ? maskError(this.navTerminalError) : null;
+    const controls = NAV_TERMINAL_CONTROLS;
+    const controlsHeight = controls.topPadding + controls.borderWidth + controls.headingHeight
+      + controls.buttonHeight + 2 * controls.gap + (error ? controls.errorHeight + controls.gap : 0);
+    const { tabHeight, moreHeight } = dataModule.SIDEBAR_TERMINAL_METRICS;
+    const { listHeight, scroll } = dataModule.sidebarListBudget({
+      height,
+      headerHeight: this.navHeights.header,
+      footerHeight: this.navHeights.footer,
+      controlsHeight,
+      insetHeight: topPadding + bottomPadding + 2 * navGap,
+      minListHeight: live.spacesList?.some((space) => space?.tabs?.length) ? moreHeight : tabHeight,
+    });
+    const trackHeight = (part) => ({ height }, cx) => {
+      if (this.navHeights[part] === height) return;
+      this.navHeights[part] = height;
+      cx.notify();
+    };
+
     return v_flex()
       .id("nav")
       .when(this.part === "nav", (el) => el.size_full().min_h(0))
@@ -1187,16 +1223,17 @@ export default class HerdrControl extends View {
         el.w(232).h_full().min_h(0).flex_none().border_r(1).border_color(PALETTE.line),
       )
       .bg(PALETTE.surface)
-      .overflow_y_scrollbar()
+      .when(scroll, (el) => el.overflow_y_scrollbar())
       .px(10)
-      .py(14)
-      // macOS draws its traffic lights over a titlebar-less layout; keep the header below them.
-      .when(!this.embeddedPanel && trafficLightsOverNav(), (el) => el.pt(38))
-      .gap(10)
+      .pt(topPadding)
+      .pb(bottomPadding)
+      .gap(navGap)
       .child(
         v_flex()
+          .id("nav-header")
           .w_full()
           .flex_none()
+          .on_size_change(trackHeight("header"))
           .gap(12)
           .child(
             h_flex()
@@ -1285,12 +1322,14 @@ export default class HerdrControl extends View {
               ),
           ),
       )
-      .child(this.renderNavTerminals(live.spacesList, live.panesList))
+      .child(this.renderNavTerminals(live.spacesList, live.panesList, listHeight, error))
       .child(
         v_flex()
+          .id("nav-footer")
           .w_full()
           .flex_none()
-          .gap(10)
+          .on_size_change(trackHeight("footer"))
+          .gap(navGap)
           .when(usageRows.length > 0, (el) => el.child(renderSidebarUsage(usageRows, false, usageCollapsed)))
           .child(
             h_flex()
