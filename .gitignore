@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+/reports/
+/ref/
+/mods/herdr-control/catalog.local.js
+.DS_Store
+node_modules/
+.idea/
+.vscode/
+.vs/
+*.log
