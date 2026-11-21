@@ -1,0 +1,11 @@
+{
+  "name": "herdr-control-local",
+  "description": "Local Herdr Control plugins",
+  "owner": { "name": "Herdr Control" },
+  "plugins": [
+    {
+      "name": "herdr-usage-limits",
+      "source": "./"
+    }
+  ]
+}

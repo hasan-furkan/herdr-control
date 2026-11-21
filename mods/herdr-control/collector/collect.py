@@ -16,6 +16,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import shlex
 import socket
 import sqlite3
 import stat
@@ -2243,14 +2244,18 @@ def _limit_record(windows, read_at, source="file"):
     if not isinstance(windows, dict):
         return None
     out = {}
-    for name in ("five", "week"):
-        window = windows.get(name)
-        out[name] = (
-            _limit_window(window.get("remaining"), window.get("resets_at"))
-            if isinstance(window, dict) else None
-        )
+    for name, window in windows.items():
+        if not isinstance(window, dict):
+            continue
+        parsed = _limit_window(window.get("remaining"), window.get("resets_at"))
+        if parsed:
+            if _number(window.get("window_minutes")):
+                parsed["window_minutes"] = window["window_minutes"]
+            out[name] = parsed
     if not any(out.values()):
         return None
+    out.setdefault("five", None)
+    out.setdefault("week", None)
     return dict(out, source=source, read_at=read_at)
 
 
@@ -2288,21 +2293,36 @@ def _read_codex_limits(files, budget):
                 if limits is None:
                     continue
                 windows = {}
-                for key, name in (("primary", "five"), ("secondary", "week")):
+                for key in ("primary", "secondary"):
                     window = limits.get(key)
                     if not isinstance(window, dict):
                         continue
                     try:
+                        minutes = int(window.get("window_minutes"))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if minutes < 1:
+                        continue
+                    name = ("five" if abs(minutes - 300) <= 30 else
+                            "week" if abs(minutes - 10080) <= 360 else
+                            "month" if abs(minutes - 43200) <= 1440 else f"window_{minutes}")
+                    try:
                         used = float(window.get("used_percent", 0))
                     except (TypeError, ValueError, OverflowError):
                         continue
-                    windows[name] = _limit_window(100 - used, window.get("resets_at"))
+                    parsed = _limit_window(100 - used, window.get("resets_at"))
+                    if parsed:
+                        parsed["window_minutes"] = minutes
+                        windows[name] = parsed
                 record = _limit_record(windows, mtime_ns / 1e9)
                 if record:
                     return record
         except OSError:
             continue
     return None
+
+
+CODEX_LIMITS_CACHE_VERSION = 2
 
 
 def codex_limits(home, cache_dir, now=None, notes=None):
@@ -2322,7 +2342,7 @@ def codex_limits(home, cache_dir, now=None, notes=None):
         return None
     newest_file, size, mtime_ns = files[0]
     newest = [_cache_key("codex", newest_file), size, mtime_ns]
-    if isinstance(cached, dict) and cached.get("newest") == newest:
+    if isinstance(cached, dict) and cached.get("version") == CODEX_LIMITS_CACHE_VERSION and cached.get("newest") == newest:
         data = cached.get("data")
     else:
         try:
@@ -2330,15 +2350,19 @@ def codex_limits(home, cache_dir, now=None, notes=None):
         except _ScanExpired:
             budget.notes.append("limits.codex: scan time limit reached")
             return None
-        _write_json_atomic(path, {"newest": newest, "data": data})
+        _write_json_atomic(path, {"version": CODEX_LIMITS_CACHE_VERSION, "newest": newest, "data": data})
 
     # Apply expiration on every run, including when the session log has not changed.
     if data:
-        for name in ("five", "week"):
-            window = data.get(name)
-            reset = window.get("resets_at") if window else None
+        for name, window in list(data.items()):
+            if not isinstance(window, dict):
+                continue
+            reset = window.get("resets_at")
             if reset is not None and reset < now:
-                data[name] = _limit_window(100, None)
+                expired = _limit_window(100, None)
+                if _number(window.get("window_minutes")):
+                    expired["window_minutes"] = window["window_minutes"]
+                data[name] = expired
     return data
 
 
@@ -2492,13 +2516,47 @@ def collect_limits(cache_dir, errors, home=None, now=None, *, notes=None):
     }
 
 
-def collect_installed(errors):
+def collect_installed(errors, home=None):
     cmds = ("claude", "opencode", "codex", "agy", "pi", "gemini")
+    base_home = Path.home() if home is None else Path(home)
+    search_path = os.pathsep.join(
+        p for p in (os.environ.get("PATH", ""), str(base_home / ".opencode" / "bin"), str(base_home / ".local" / "bin")) if p
+    )
     try:
-        return {cmd: shutil.which(cmd) is not None for cmd in cmds}
+        return {cmd: shutil.which(cmd, path=search_path) is not None for cmd in cmds}
     except Exception as exc:
         errors.append(_short_err("installed", exc))
         return None
+
+
+def collect_ssh_hosts(home=None):
+    """Read simple SSH Host/HostName pairs without expanding wildcards."""
+    path = (Path.home() if home is None else Path(home)) / ".ssh" / "config"
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    aliases, hostname = [], None
+    out = []
+    def flush():
+        if hostname:
+            out.extend({"alias": alias, "hostname": hostname} for alias in aliases)
+    for line in lines:
+        try:
+            parts = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if len(parts) < 2:
+            continue
+        key, value = parts[0].lower(), parts[1]
+        if key == "host":
+            flush()
+            aliases = [item for item in parts[1:] if not any(c in item for c in "*?!")]
+            hostname = None
+        elif key == "hostname" and aliases:
+            hostname = value
+    flush()
+    return out[:1000]
 
 
 # ---------------------------------------------------------------------------
@@ -3080,6 +3138,7 @@ def main():
         "generated_at": _now_iso(),
         "system": system_data,
         "tailscale": tailscale_raw,
+        "ssh_hosts": collect_ssh_hosts(),
         "ports": ports_data,
         "usage": usage_data,
         "live": live_data,

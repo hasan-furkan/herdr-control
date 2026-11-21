@@ -50,9 +50,20 @@ function arrayOf(validate) {
 }
 
 const peerFields = { name: boundedString, ip: boundedString, os: boundedString };
+const sshHosts = arrayOf(objectOf({ alias: boundedString, hostname: boundedString }, ["alias", "hostname"]));
 const provider = oneOf("claude", "codex", "opencode", "antigravity");
 const limitWindow = objectOf({ remaining: percent, resets_at: counter }, ["remaining"]);
-const providerLimit = objectOf({ five: limitWindow, week: limitWindow, read_at: counter });
+const providerLimit = (value) => {
+  if (!record(value)) return undefined;
+  const clean = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "read_at") { clean.read_at = counter(item); continue; }
+    if (!/^[a-z][a-z0-9_]{0,30}$/.test(key) || !record(item)) continue;
+    const win = objectOf({ remaining: percent, resets_at: counter, window_minutes: counter }, ["remaining"])(item);
+    if (win) clean[key] = win;
+  }
+  return Object.keys(clean).some((key) => key !== "read_at") ? clean : undefined;
+};
 const opencodeWindow = oneOf("5-hour", "weekly", "monthly");
 const opencodeLimit = objectOf({
   reached: objectOf({
@@ -102,6 +113,7 @@ const collectorRemoteFields = {
     cpu_pct: percent, cpu_cores: counter, cpu_model: boundedString,
     ram_used_b: counter, ram_total_b: counter, disk_used_b: counter, disk_total_b: counter,
   }),
+  ssh_hosts: sshHosts,
   ports: arrayOf(objectOf({
     port: portNumber, addr: boundedString, pid: counter, process: boundedString, cwd: boundedString,
     access: oneOf("public", "tailnet", "local"),
@@ -255,6 +267,11 @@ export function buildUsageRows(entries, now = new Date()) {
   const { providers } = summarizeUsageTokens(entries, localIsoDate(now));
   const nowS = now.getTime() / 1000;
   return USAGE_PROVIDERS.flatMap(({ id, label }) => {
+    const installedKey = id === "antigravity" ? "agy" : id;
+    const installed = entries.some((entry) => entry?.result?.installed?.[installedKey] === true);
+    const installationKnown = entries.some((entry) => entry?.result?.installed && Object.hasOwn(entry.result.installed, installedKey));
+    if (installationKnown && !installed) return [];
+    let hint = null;
     let limits = null;
     let limitNotice = null;
     if (id === "opencode") {
@@ -270,27 +287,62 @@ export function buildUsageRows(entries, now = new Date()) {
     } else {
       for (const entry of entries) {
         const candidate = entry?.result?.limits?.[id];
-        if (!Number.isFinite(candidate?.five?.remaining) && !Number.isFinite(candidate?.week?.remaining)) continue;
+        if (!candidate || !Object.values(candidate).some((window) => Number.isFinite(window?.remaining))) continue;
         if (!limits || (candidate.read_at ?? 0) > (limits.read_at ?? 0)) limits = candidate;
       }
     }
+    if (id === "claude" && installed) {
+      const at = limits?.read_at;
+      if (!Number.isFinite(at) || nowS - at > 6 * 3600) hint = "Open a Claude session";
+    }
     const tokens = providers.get(id);
-    if (!limits && !tokens && !limitNotice) return [];
-    const reset = limits?.five?.resets_at;
-    const minutes = Number.isFinite(reset) && reset > nowS ? Math.ceil((reset - nowS) / 60) : null;
-    const countdown = minutes === null ? "—"
-      : minutes < 60 ? `${minutes}m`
-        : `${Math.floor(minutes / 60)}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`;
+    if (!installed && !limits && !tokens && !limitNotice) return [];
+    const windows = Object.entries(limits ?? {})
+      .filter(([key, value]) => key !== "read_at" && Number.isFinite(value?.remaining))
+      .map(([key, value]) => ({
+        key,
+        label: codexWindowLabel(value.window_minutes, key),
+        remaining: value.remaining,
+        resets_at: value.resets_at,
+        countdown: formatResetCountdown(value.resets_at, nowS),
+      }));
+    const fiveWindow = windows.find((window) => window.label === "5h");
+    const weekWindow = windows.find((window) => window.label === "week");
+    const countdown = fiveWindow?.countdown ?? "—";
     return [{
       id,
       label,
-      five: Number.isFinite(limits?.five?.remaining) ? limits.five.remaining : null,
-      week: Number.isFinite(limits?.week?.remaining) ? limits.week.remaining : null,
+      five: fiveWindow?.remaining ?? null,
+      week: weekWindow?.remaining ?? null,
+      ...(windows.length ? { windows } : {}),
       countdown,
       tokens: formatTokens(tokens?.tokens, { estimated: tokens?.estimated }),
+      ...(hint ? { hint } : {}),
       ...(limitNotice ? { limitNotice } : {}),
     }];
   });
+}
+
+function formatResetCountdown(resetsAt, nowS) {
+  if (!Number.isFinite(resetsAt) || resetsAt <= nowS) return "—";
+  const minutes = Math.ceil((resetsAt - nowS) / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const remMin = minutes % 60;
+    return `${hours}h${remMin ? ` ${remMin}m` : ""}`;
+  }
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return `${days}d${remHours ? ` ${remHours}h` : ""}`;
+}
+
+function codexWindowLabel(minutes, fallback) {
+  if (!Number.isFinite(minutes)) return fallback === "five" ? "5h" : fallback;
+  if (Math.abs(minutes - 300) <= 30) return "5h";
+  if (Math.abs(minutes - 10080) <= 360) return "week";
+  if (Math.abs(minutes - 43200) <= 1440) return "30d";
+  return `${minutes}m`;
 }
 
 export function summarizeUsageCard(rows, { compact = false } = {}) {
@@ -1490,6 +1542,7 @@ export function buildMachineModels({
   const localRes = localEntry?.result ?? null;
   const ts = localRes?.tailscale ?? null;
   const localHostname = localRes?.system?.hostname || null;
+  const sshHosts = localRes?.ssh_hosts ?? [];
   const localTsName = ts?.self?.name || null;
 
   let selfPingMs = null;
@@ -1549,6 +1602,7 @@ export function buildMachineModels({
       pingMs: isLocal ? selfPingMs : null,
       lastSeen: null,
       collectorEntry: cEntry,
+      sshHostNames: sshHosts.filter((host) => String(host.alias).toLowerCase() === String(hm.name ?? "").toLowerCase()).map((host) => host.hostname),
     });
   }
 
@@ -1579,12 +1633,22 @@ export function buildMachineModels({
   // (WSL and its Windows host can share one Tailscale address).
   const herdrKeyForPeer = (peer) => {
     const pName = String(peer.name).toLowerCase();
+    const peerNames = new Set([pName, pName.split(".")[0]]);
+    const peerIp = String(peer.ip ?? "").toLowerCase();
+    const sameName = (value) => {
+      const host = String(value ?? "").replace(/\.$/, "").toLowerCase();
+      return peerNames.has(host) || peerNames.has(host.split(".")[0]);
+    };
     if (merged.has(pName)) return pName;
     const remotes = [...merged].filter(([, m]) => !m.isLocal && m.isHerdrMachine);
     const byName = remotes.find(([, m]) => m.tsName && String(m.tsName).toLowerCase() === pName);
     if (byName) return byName[0];
+    const bySshHost = remotes.find(([, m]) => (m.sshHostNames ?? []).some(sameName));
+    if (bySshHost) return bySshHost[0];
     const byIp = peer.ip ? remotes.filter(([, m]) => m.ip && m.ip === peer.ip) : [];
-    return byIp.length === 1 ? byIp[0][0] : pName;
+    if (byIp.length === 1) return byIp[0][0];
+    const sshByIp = peerIp ? remotes.filter(([, m]) => (m.sshHostNames ?? []).some((host) => String(host).toLowerCase() === peerIp)) : [];
+    return sshByIp.length === 1 ? sshByIp[0][0] : pName;
   };
 
   for (const peer of ts?.peers ?? []) {

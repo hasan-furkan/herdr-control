@@ -85,9 +85,15 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
   const percentLabel = (label, value) => `${label} ${value === null ? "—" : `${value}%`}`;
   const summary = dataModule.summarizeUsageCard(rows);
   const summaryColor = rows.some((row) => row.limitNotice) ? PALETTE.danger : PALETTE.muted;
+  const formatWindow = (win) => {
+    const pct = percentLabel(win.label, win.remaining);
+    return win.countdown && win.countdown !== "—" ? `${pct} · ${win.countdown}` : pct;
+  };
   const details = () => rows.map((row) => {
     const limit = row.id === "opencode" ? row.limitNotice ?? "—"
-      : `${percentLabel("5h", row.five)} · ${percentLabel("week", row.week)} · reset ${row.countdown}`;
+      : row.hint ?? (row.windows?.length
+        ? row.windows.map(formatWindow).join(" · ")
+        : `${percentLabel("5h", row.five)} · ${percentLabel("week", row.week)}`);
     return `${row.label} · ${limit} · today ${row.tokens}`;
   }).join("\n");
   const card = v_flex()
@@ -128,8 +134,15 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
     div().flex_none().whitespace_nowrap()
       .text_color(value === null ? PALETTE.muted : value < 15 ? PALETTE.danger : value < 30 ? PALETTE.warn : PALETTE.ok)
       .child(percentLabel(label, value));
+  const windowLine = (win) =>
+    h_flex().w_full().justify_between().gap(4).font_family(monoFont())
+      .child(percent(win.label, win.remaining))
+      .when(win.countdown && win.countdown !== "—", (el) =>
+        el.child(div().flex_none().whitespace_nowrap().text_color(PALETTE.muted)
+          .tooltip(`${win.label} window reset`).child(`· ${win.countdown}`)));
   return toggleCard.children(rows.map((row) => {
     const isOpenCode = row.id === "opencode";
+    const windows = row.windows?.length ? row.windows : null;
     return v_flex()
       .id(`sidebar-usage-${row.id}`)
       .w_full()
@@ -138,23 +151,26 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
       .border_t(1)
       .border_color(PALETTE.line)
       .text_size(SIZES.xs)
-      .child(div().font_semibold().text_color(PALETTE.text).child(row.label))
       .child(
-        isOpenCode
-          ? div().font_family(monoFont()).text_color(row.limitNotice ? PALETTE.danger : PALETTE.muted)
-            .child(row.limitNotice ?? "—")
-          : h_flex().w_full().gap(8).font_family(monoFont())
+        h_flex().w_full().justify_between().gap(4)
+          .child(div().font_semibold().text_color(PALETTE.text).child(row.label))
+          .child(div().flex_none().whitespace_nowrap().font_family(monoFont()).text_color(PALETTE.muted)
+            .tooltip(row.id === "antigravity" ? "Today's tokens (estimated)" : "Today's tokens")
+            .child(row.tokens)),
+      )
+      .when(isOpenCode || Boolean(row.hint), (el) =>
+        el.child(
+          div().font_family(monoFont()).text_color(row.limitNotice ? PALETTE.danger : PALETTE.muted)
+            .child(row.limitNotice ?? row.hint ?? "—"),
+        ))
+      .when(!isOpenCode && !row.hint && Boolean(windows), (el) =>
+        el.children(windows.map(windowLine)))
+      .when(!isOpenCode && !row.hint && !windows, (el) =>
+        el.child(
+          h_flex().w_full().gap(8).font_family(monoFont())
             .child(percent("5h", row.five))
             .child(percent("week", row.week)),
-      )
-      .child(
-        h_flex().w_full().justify_between().gap(5).font_family(monoFont()).text_color(PALETTE.muted)
-          .when(!isOpenCode, (el) =>
-            el.child(div().whitespace_nowrap().tooltip("5h window reset").child(row.countdown)))
-          .child(div().whitespace_nowrap().tooltip(
-            row.id === "antigravity" ? "Today's tokens (estimated)" : "Today's tokens",
-          ).child(row.tokens)),
-      );
+        ));
   }));
 }
 

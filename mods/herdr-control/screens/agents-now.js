@@ -522,7 +522,7 @@ function buildHeroSection({
 
 function buildQuotasCard({ ui, palette, collectEntries, narrow }) {
   const { PALETTE, SIZES, RADII, monoFont } = palette;
-  const rows = buildUsageRows(collectEntries, dashboardNow()).filter((row) => row.five !== null || row.week !== null);
+  const rows = buildUsageRows(collectEntries, dashboardNow()).filter((row) => row.five !== null || row.week !== null || (row.windows?.length ?? 0) > 0);
   const container = narrow
     ? v_flex().w_full().gap(10)
     : h_flex().w_full().items_stretch().gap(10);
@@ -539,19 +539,16 @@ function buildQuotasCard({ ui, palette, collectEntries, narrow }) {
       .border(1)
       .border_color(PALETTE.line)
       .child(div().text_size(SIZES.sm).font_bold().text_color(PALETTE.text).child(row.label))
-      .children([["5h", row.five], ["week", row.week]].map(([label, value]) =>
+      .children((row.windows?.length ? row.windows : [{ label: "5h", remaining: row.five, countdown: row.countdown }, { label: "week", remaining: row.week, countdown: "—" }]).map(({ label, remaining: value, countdown }) =>
         value === null
           ? div().text_size(SIZES.xs).font_family(monoFont()).text_color(PALETTE.muted).child(`${label} · —`)
           : ui.progressBar({
-              label,
+              label: countdown && countdown !== "—" ? `${label} · ${countdown}` : label,
               valueLabel: `${value}%`,
               ratio: value / 100,
               height: 7,
               color: value < 15 ? PALETTE.danger : value < 30 ? PALETTE.warn : PALETTE.ok,
             }),
-      ))
-      .when(row.countdown !== "—", (el) => el.child(
-        div().text_size(SIZES.xs).text_color(PALETTE.muted).child(`5h window resets in ${row.countdown}`),
       )),
   );
 

@@ -1,0 +1,6 @@
+{
+  "name": "herdr-usage-limits",
+  "version": "1.0.0",
+  "description": "Shares Claude Code rate limit windows with Herdr Control",
+  "author": { "name": "Herdr Control contributors" }
+}

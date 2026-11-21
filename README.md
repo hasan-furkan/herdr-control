@@ -63,6 +63,8 @@ See [RECIPE.md](RECIPE.md) for install, update, and uninstall steps.
 
 Run the commands from this project's root for a fresh installation. The links point to this checkout, so keep it in place after installation. If the layout name already exists, copy the JSON to an unused filename and use that name when switching layouts. See [RECIPE.md](RECIPE.md) if any of the four mod folders are already installed.
 
+The standard install also installs the Claude limits plugin for the current user when the `claude` command is available. It adds one isolated plugin and leaves the user's status line, hooks, and other plugins intact. The plugin writes the live limits snapshot to `~/.claude/limits-claude.json`; see [RECIPE.md](RECIPE.md#claude-code-limits-plugin) for install, update, and removal commands.
+
 #### Windows (PowerShell)
 
 Create directory junctions with `New-Item -ItemType Junction`. Command Prompt's `mklink /J` creates the same kind of link.

@@ -148,7 +148,11 @@ const { inControlLayout, jump } = await import("./nav.js");
 const { default: Tabs } = await import("../herdr-control-tabs/main.js");
 const { default: Phrases } = await import("../herdr-control-phrases/main.js");
 const controlLayout = JSON.parse(readFileSync(new URL("../../layouts/herdr-control.json", import.meta.url), "utf8"));
-const panelNode = JSON.parse(readFileSync(new URL("../../layouts/snippets/herdr-control-panel.json", import.meta.url), "utf8"));
+let panelNode = null;
+try { panelNode = JSON.parse(readFileSync(new URL("../../layouts/snippets/herdr-control-panel.json", import.meta.url), "utf8")); } catch (error) {
+  if (error?.code !== "ENOENT") throw error;
+}
+const panelTest = panelNode ? test : test.skip;
 
 test("demo fixtures survive collector validation and exercise the dashboard view models", () => {
   const now = new Date();
@@ -226,7 +230,7 @@ test("full-layout navigation requires the control stack even when the layout nam
     ]);
 
     state.set("layout", "herdr-control");
-    state.set("test.layout", { type: "row", children: [{ id: "work-stack", type: "stack" }, panelNode] });
+    state.set("test.layout", { type: "row", children: [{ id: "work-stack", type: "stack" }, { id: "panel", content: { mod: "herdr-control" } }] });
     assert.equal(inControlLayout(), false);
     jump("agent.focus", terminal);
     assert.deepEqual(calls, [["agent.focus", terminal]]);
@@ -236,7 +240,7 @@ test("full-layout navigation requires the control stack even when the layout nam
   }
 });
 
-test("the installed panel renders its own dashboard without a terminal return control", () => {
+panelTest("the installed panel renders its own dashboard without a terminal return control", () => {
   state.set("test.layout", { type: "row", children: [panelNode] });
   setDemo(true);
   const cx = { spawn() {}, notify() {}, timer: { every() {} } };
@@ -346,7 +350,7 @@ test("screenshot commands drive the layout, panel and tab in live and demo modes
   ];
 
   try {
-    for (const part of ["nav", "panel", null]) {
+    for (const part of (panelNode ? ["nav", "panel", null] : ["nav", null])) {
       for (const demo of [false, true]) {
         state.clear();
         calls.length = 0;
@@ -688,8 +692,19 @@ test("usage rows combine today's machine tokens with the newest provider limits"
     } },
   ];
   assert.deepEqual(buildUsageRows(entries, now), [
-    { id: "claude", label: "Claude", five: 87, week: 46, countdown: "2h 10m", tokens: "1.2M tok" },
-    { id: "codex", label: "Codex", five: null, week: 0, countdown: "—", tokens: "—" },
+    {
+      id: "claude", label: "Claude", five: 87, week: 46,
+      windows: [
+        { key: "five", label: "5h", remaining: 87, resets_at: reset, countdown: "2h 10m" },
+        { key: "week", label: "week", remaining: 46, resets_at: undefined, countdown: "—" },
+      ],
+      countdown: "2h 10m", tokens: "1.2M tok",
+    },
+    {
+      id: "codex", label: "Codex", five: null, week: 0,
+      windows: [{ key: "week", label: "week", remaining: 0, resets_at: reset, countdown: "2h 10m" }],
+      countdown: "—", tokens: "—",
+    },
     { id: "antigravity", label: "Antigravity", five: null, week: null, countdown: "—", tokens: "~10K tok" },
     { id: "opencode", label: "OpenCode", five: null, week: null, countdown: "—", tokens: "100 tok" },
   ]);
@@ -698,6 +713,76 @@ test("usage rows combine today's machine tokens with the newest provider limits"
   assert.equal(summarizeUsageTokens(entries.slice(0, 1), date).total, null);
   assert.equal(summarizeUsageTokens(entries, "2026-11-18").total, 0);
   assert.equal(buildUsageRows(entries, new Date(reset * 1000 + 1))[0].countdown, "—");
+});
+
+test("usage rows include installed providers with no tokens and keep Codex windows automatic", () => {
+  const now = new Date("2026-11-21T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+  const entries = [{ result: {
+    installed: { claude: true, codex: true, agy: true, opencode: true },
+    limits: {
+      claude: { five: { remaining: 50, resets_at: nowS + 3600 }, read_at: nowS - 7 * 3600 },
+      codex: { month: { remaining: 27, resets_at: nowS + 12 * 86400 + 4 * 3600, window_minutes: 43200 }, read_at: nowS },
+      antigravity: {
+        five: { remaining: 82, resets_at: nowS + 4 * 3600 + 23 * 60 },
+        week: { remaining: 95, resets_at: nowS + 6 * 86400 + 22 * 3600 },
+        read_at: nowS,
+      },
+      opencode: { reached: { window: "monthly", resets_at: nowS + 3600 }, source: "log" },
+    },
+  } }];
+  const rows = buildUsageRows(entries, now);
+  assert.deepEqual(rows.map((row) => row.id), ["claude", "codex", "antigravity", "opencode"]);
+  assert.equal(rows[0].hint, "Open a Claude session");
+  assert.deepEqual(rows[1].windows.map(({ label, remaining, countdown }) => [label, remaining, countdown]), [["30d", 27, "12d 4h"]]);
+  assert.equal(rows[1].week, null);
+  assert.deepEqual(
+    rows[2].windows.map(({ label, remaining, countdown }) => [label, remaining, countdown]),
+    [["5h", 82, "4h 23m"], ["week", 95, "6d 22h"]],
+  );
+  assert.match(rows[3].limitNotice, /monthly limit reached/);
+  assert.deepEqual(buildUsageRows([{ result: { installed: { opencode: false } } }], now), []);
+});
+
+test("live collector shape keeps Codex 30d window and installed OpenCode through validation", () => {
+  const now = new Date("2026-11-21T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+  const raw = {
+    version: 1,
+    generated_at: now.toISOString(),
+    installed: { claude: true, opencode: true, codex: true, agy: true, pi: false, gemini: false },
+    limits: {
+      claude: null,
+      codex: {
+        month: { remaining: 20.0, resets_at: nowS + 2 * 86400 + 5 * 3600, window_minutes: 43200 },
+        five: null,
+        week: null,
+        source: "file",
+        read_at: nowS - 60,
+      },
+      antigravity: {
+        five: { remaining: 82.8, resets_at: nowS + 4 * 3600 + 23 * 60 },
+        week: { remaining: 95.1, resets_at: nowS + 6 * 86400 + 22 * 3600 },
+        source: "cli",
+        read_at: nowS - 60,
+      },
+      opencode: null,
+    },
+    usage: { days: [] },
+  };
+  const clean = validateCollectorResult(raw);
+  assert.equal(clean.installed.opencode, true);
+  assert.equal(clean.limits.codex.month.window_minutes, 43200);
+  const rows = buildUsageRows([{ machine: null, result: clean }], now);
+  assert.deepEqual(rows.map((row) => row.id), ["claude", "codex", "antigravity", "opencode"]);
+  assert.equal(rows[0].hint, "Open a Claude session");
+  assert.deepEqual(
+    rows[1].windows.map(({ label, remaining, countdown }) => [label, remaining, countdown]),
+    [["30d", 20, "2d 5h"]],
+  );
+  assert.equal(rows[3].five, null);
+  assert.equal(rows[3].week, null);
+  assert.equal(rows[3].tokens, "—");
 });
 
 test("sidebar switches to single-line cards at the short-height boundaries", () => {
@@ -1450,12 +1535,13 @@ test("container names start alphanumeric and Docker logs separates the name from
 });
 
 test("buildMachineModels folds a Tailscale peer into the Herdr machine named by SSH alias", () => {
-  const winSelf = { name: "workstation", ip: "100.64.0.10", os: "windows" };
+  const winSelf = { name: "workstation-01", ip: "100.64.0.10", os: "windows" };
   const localEntry = {
     machine: null,
     at: 1700000000000,
     result: {
       system: { hostname: "laptop.local", os: "macOS 27.2.1" },
+      ssh_hosts: [{ alias: "windows", hostname: "Workstation-01.tailnet.ts.net" }],
       tailscale: {
         tailnet: "example-tailnet.ts.net",
         self: { name: "laptop", ip: "100.64.0.11", os: "macOS" },
@@ -1474,7 +1560,7 @@ test("buildMachineModels folds a Tailscale peer into the Herdr machine named by 
     at: 1700000001000,
     result: {
       system: { hostname: "WORKSTATION", os: "Microsoft Windows 11 Pro" },
-      tailscale: { tailnet: "example-tailnet.ts.net", self: winSelf, peers: [], serve: [] },
+      tailscale: null,
       ports: [],
       remote: null,
     },

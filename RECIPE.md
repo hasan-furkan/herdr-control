@@ -23,18 +23,21 @@ Ask the user to choose **Option A: Layout** or **Option B: Mod only** if their r
 2. Copy the four directories under this repository's `mods/` into `<config>/mods/` under the same names. Exclude `catalog.local.js` and Python cache files from the source copy.
 3. Copy `layouts/herdr-control.json` into `<config>/layouts/`. If that filename is taken, use an unused name such as `herdr-control-gallery.json`. Ask before overwriting an existing layout. Copy the whole layout as one file and keep the node IDs and mod references.
 4. Switch with `herdr-app do layout.switch --name herdr-control`, substituting the filename stem chosen above. Leave the previous layout available.
+5. Install the Claude limits plugin below when `claude` is available on this machine; skip this step silently when it is absent.
 
 ### Update
 
 1. Back up the four destination mod folders. Check for symlinks or junctions and preserve their targets when replacing the installed folders. Stage and validate the four replacement folders before swapping them in. Restore from the backup if the swap fails.
 2. Replace only those four mod folders. Restore the user's `herdr-control/catalog.local.js` into its original location and reapply any custom `TRAFFIC_LIMITS` entries to the new `limits.js`.
 3. Keep the selected layout, all layout files and saved layout state, settings, keys, and unrelated mods. If the user explicitly requests a layout change, merge by node ID and reuse existing nodes.
+4. If Claude Code is installed, update the separate Herdr Claude limits plugin using the command below. Do not modify Claude settings, status lines, hooks, or other plugins.
 
 ### Options and uninstall
 
 - Set `HERDR_CONTROL_PHRASES_FILE` in Herdr's environment for the phrasebook. On Windows, `HERDR_CONTROL_AGY_PROBE=1` enables the optional Antigravity quota probe. Customize traffic policies in `herdr-control/limits.js` and the agent roster in `herdr-control/catalog.local.js` under the installed `mods/` directory.
 - For screenshots, use the Tools overlay's **Herdr Control: Toggle demo data** or run `herdr-app do herdr-control.toggle-demo` while Herdr Control is visible. Run it again to resume live collection. The top bar shows **DEMO DATA** while enabled.
 - To uninstall, switch to the prior layout. Back up local mod settings and the installed layout. Remove only the layout file created during install and the four installed mod folders once no other layout refers to them. Remove an installed link by its name while preserving its target.
+- If Claude Code is installed, remove only the Herdr Claude limits plugin with the uninstall command below.
 
 ## Option B: Mod only
 
@@ -44,6 +47,7 @@ Ask the user to choose **Option A: Layout** or **Option B: Mod only** if their r
 2. Copy only `mods/herdr-control` into `<config>/mods/`. Reuse an existing Herdr Control installation or follow the update procedure below. Ask before replacing unrelated content with the same name. Exclude `catalog.local.js` and Python cache files from the source copy.
 3. Search the target layout for a block with `content.mod` set to `herdr-control`. If one exists, update that node in place to use `content.props.part` set to `panel`, keeping its ID and placement. If there are multiple matches, ask which single node to update. Otherwise, insert exactly one copy of [the panel node](layouts/snippets/herdr-control-panel.json) into an existing `row`'s `children`, beside the active-tab area on the requested side. Choose an unused ID if `herdr-control-panel` is already taken.
 4. Keep every other layout node and field, saved layout state, settings, key bindings, and other mods intact. Validate the edited JSON and run `herdr-app check` on the installed mod.
+5. Install the Claude limits plugin below when `claude` is available on this machine; skip this step silently when it is absent.
 
 The user can show or hide the block with `herdr-app do layout.toggle --id herdr-control-panel`. Use the actual node ID if it differs. If the user configures their own shortcut, an example entry under `layout:<name>` in `keys.json` is `"ctrl-alt-h": {"command":"layout.toggle","args":{"id":"herdr-control-panel"}}`.
 
@@ -51,5 +55,31 @@ For the on-demand tab, install the same mod folder and run `herdr-app do tab.new
 
 ### Update and uninstall
 
-- To update, back up and replace only the `herdr-control` mod folder. Preserve any link target, restore the user's `catalog.local.js`, and reapply their custom `TRAFFIC_LIMITS` entries. Keep the existing panel node and layout settings.
+- To update, back up and replace only the `herdr-control` mod folder. Preserve any link target, restore the user's `catalog.local.js`, and reapply their custom `TRAFFIC_LIMITS` entries. Keep the existing panel node and layout settings. If Claude Code is installed, also update the separate Herdr Claude limits plugin using the command below.
 - To uninstall, back up the layout and local mod settings, then remove only the installed panel node. Close any Herdr Control tabs. Remove the `herdr-control` folder once no other layout uses it. For a symlink or junction, remove the link and preserve its target.
+- If Claude Code is installed, remove only the Herdr Claude limits plugin with the uninstall command below.
+
+## Claude Code limits plugin
+
+This plugin runs in Claude Code sessions and writes only `~/.claude/limits-claude.json`. It reads Claude's live five-hour and weekly rate limits and refreshes once per minute. Its data feeds Herdr Control's sidebar and Agents quota card. The standard install checks for `claude`; if present, add the repository plugin directory as a local marketplace and install it at user scope:
+
+```sh
+claude plugin marketplace add /path/to/herdr-control/extras/claude-limits
+claude plugin install herdr-usage-limits@herdr-control-local --scope user
+```
+
+Use the actual absolute path to this checkout. On update, refresh the local marketplace and plugin:
+
+```sh
+claude plugin marketplace update herdr-control-local
+claude plugin update herdr-usage-limits@herdr-control-local --scope user
+```
+
+To uninstall, remove only this plugin and its local marketplace registration:
+
+```sh
+claude plugin uninstall herdr-usage-limits@herdr-control-local --scope user
+claude plugin marketplace remove herdr-control-local
+```
+
+Plugin enablement is managed by Claude Code's plugin system. The install does not write the user's `settings.json` directly or change the status line, hooks, or other plugins.

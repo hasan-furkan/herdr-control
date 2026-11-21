@@ -53,6 +53,16 @@ class CollectorTests(unittest.TestCase):
         self.cache = self.home / "cache"
         self.now = 1795197207
 
+    def test_ssh_config_hosts_collect_only_literal_aliases(self):
+        config = self.home / ".ssh" / "config"
+        config.parent.mkdir(parents=True)
+        config.write_text("Host *\n  HostName ignored.example\nHost windows desktop\n HostName workstation-01.tailnet.ts.net\nHost 100.64.0.8\n HostName 100.64.0.8\n", encoding="utf-8")
+        self.assertEqual(collect.collect_ssh_hosts(self.home), [
+            {"alias": "windows", "hostname": "workstation-01.tailnet.ts.net"},
+            {"alias": "desktop", "hostname": "workstation-01.tailnet.ts.net"},
+            {"alias": "100.64.0.8", "hostname": "100.64.0.8"},
+        ])
+
     def write_json(self, relative_path, data):
         path = self.home / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,15 +459,15 @@ class CollectorTests(unittest.TestCase):
         path = self.home / ".codex" / "sessions" / "2026" / "session.jsonl"
         path.parent.mkdir(parents=True)
         reset = self.now + 3600
-        windows = {"primary": {"used_percent": 13, "resets_at": reset},
-                   "secondary": {"used_percent": "54.5", "resets_at": self.now - 1}}
+        windows = {"primary": {"used_percent": 13, "window_minutes": 300, "resets_at": reset},
+                   "secondary": {"used_percent": "54.5", "window_minutes": 10080, "resets_at": self.now - 1}}
         record = {"payload": {"wrapped": [{"rate_limits": windows}]}}
         path.write_text('{"rate_limits": null}\n' + json.dumps(record) + '\n{"rate_limits":',
                         encoding="utf-8")
         os.utime(path, (self.now, self.now))
         self.assertEqual(collect.codex_limits(self.home, self.cache, self.now), {
-            "five": {"remaining": 87.0, "resets_at": reset},
-            "week": {"remaining": 100, "resets_at": None},
+            "five": {"remaining": 87.0, "resets_at": reset, "window_minutes": 300},
+            "week": {"remaining": 100, "resets_at": None, "window_minutes": 10080},
             "source": "file", "read_at": self.now,
         })
         stamp = collect._read_cache(self.cache / "codex-limits.json")["newest"][0]
@@ -465,11 +475,28 @@ class CollectorTests(unittest.TestCase):
         self.assertNotIn(str(path), stamp)
         with patch.object(collect, "_read_codex_limits", side_effect=AssertionError("unchanged log reread")):
             expired = collect.codex_limits(self.home, self.cache, reset + 1)
-            self.assertEqual(expired["five"], {"remaining": 100, "resets_at": None})
+            self.assertEqual(expired["five"], {"remaining": 100, "resets_at": None, "window_minutes": 300})
         windows["primary"]["used_percent"] = 30
         path.write_text(json.dumps(record), encoding="utf-8")
         os.utime(path, (self.now + 1, self.now + 1))
         self.assertEqual(collect.codex_limits(self.home, self.cache, self.now + 1)["five"]["remaining"], 70.0)
+
+    def test_codex_limits_classify_free_and_paid_windows_by_duration(self):
+        path = self.home / ".codex" / "sessions" / "session.jsonl"
+        path.parent.mkdir(parents=True)
+        free = {"rate_limits": {"primary": {"used_percent": 73, "window_minutes": 43200, "resets_at": self.now + 60}, "secondary": None}}
+        path.write_text(json.dumps(free) + "\n", encoding="utf-8")
+        os.utime(path, (self.now, self.now))
+        row = collect._read_codex_limits([(path, None, int(self.now * 1e9))], collect._ScanBudget("limits.codex", []))
+        self.assertEqual(row["month"]["remaining"], 27.0)
+        self.assertIsNone(row["five"])
+        self.assertIsNone(row["week"])
+
+        paid = {"rate_limits": {"primary": {"used_percent": 10, "window_minutes": 300}, "secondary": {"used_percent": 40, "window_minutes": 10080}}}
+        path.write_text(json.dumps(paid) + "\n", encoding="utf-8")
+        os.utime(path, (self.now + 1, self.now + 1))
+        row = collect._read_codex_limits([(path, None, int((self.now + 1) * 1e9))], collect._ScanBudget("limits.codex", []))
+        self.assertEqual((row["five"]["remaining"], row["week"]["remaining"]), (90.0, 60.0))
 
     def test_opencode_limits_use_the_newest_quota_error_and_only_emit_safe_fields(self):
         root = self.home / ".local" / "share" / "opencode" / "log"
