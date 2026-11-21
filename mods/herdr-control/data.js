@@ -263,6 +263,18 @@ const USAGE_PROVIDERS = [
   { id: "opencode", label: "OpenCode" },
 ];
 
+export function formatStaleAge(readAtS, nowS) {
+  if (!Number.isFinite(readAtS) || !Number.isFinite(nowS)) return null;
+  const diffS = Math.max(0, nowS - readAtS);
+  if (diffS <= 10 * 60) return null;
+  const minutes = Math.floor(diffS / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 export function buildUsageRows(entries, now = new Date()) {
   const { providers } = summarizeUsageTokens(entries, localIsoDate(now));
   const nowS = now.getTime() / 1000;
@@ -309,6 +321,7 @@ export function buildUsageRows(entries, now = new Date()) {
     const fiveWindow = windows.find((window) => window.label === "5h");
     const weekWindow = windows.find((window) => window.label === "week");
     const countdown = fiveWindow?.countdown ?? "—";
+    const staleAge = formatStaleAge(limits?.read_at, nowS);
     return [{
       id,
       label,
@@ -317,6 +330,7 @@ export function buildUsageRows(entries, now = new Date()) {
       ...(windows.length ? { windows } : {}),
       countdown,
       tokens: formatTokens(tokens?.tokens, { estimated: tokens?.estimated }),
+      ...(staleAge ? { staleAge } : {}),
       ...(hint ? { hint } : {}),
       ...(limitNotice ? { limitNotice } : {}),
     }];

@@ -123,6 +123,7 @@ const {
   buildUsageRows,
   countLabel,
   formatTokens,
+  formatStaleAge,
   summarizeUsageTokens,
   INVALID_COLLECTOR_RESULT,
   sidebarLayout,
@@ -667,13 +668,14 @@ test("formats singular and plural counts", () => {
 
 test("usage rows combine today's machine tokens with the newest provider limits", () => {
   const now = new Date(2026, 10, 20, 12);
-  const reset = now.getTime() / 1000 + 130 * 60;
+  const nowS = now.getTime() / 1000;
+  const reset = nowS + 130 * 60;
   const date = "2026-11-20";
   const entries = [
     { result: null },
     { result: {
       limits: {
-        claude: { five: { remaining: 92, resets_at: null }, read_at: 1 },
+        claude: { five: { remaining: 92, resets_at: null }, read_at: nowS - 600 },
         codex: { five: null, week: { remaining: 0, resets_at: reset } },
       },
       usage: { days: [
@@ -685,7 +687,7 @@ test("usage rows combine today's machine tokens with the newest provider limits"
     } },
     { result: {
       limits: {
-        claude: { five: { remaining: 87, resets_at: reset }, week: { remaining: 46 }, read_at: 2 },
+        claude: { five: { remaining: 87, resets_at: reset }, week: { remaining: 46 }, read_at: nowS - 60 },
         opencode: { five: { remaining: 57 } },
       },
       usage: { days: [{ date, provider: "claude", output: 200_000, cache_read: 80_000, cache_write: 20_000 }] },
@@ -742,6 +744,32 @@ test("usage rows include installed providers with no tokens and keep Codex windo
   );
   assert.match(rows[3].limitNotice, /monthly limit reached/);
   assert.deepEqual(buildUsageRows([{ result: { installed: { opencode: false } } }], now), []);
+});
+
+test("formatStaleAge and usage rows show staleness when limits are older than 10 minutes", () => {
+  const now = new Date("2026-11-21T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+
+  assert.equal(formatStaleAge(nowS, nowS), null);
+  assert.equal(formatStaleAge(nowS - 600, nowS), null);
+  assert.equal(formatStaleAge(nowS - 601, nowS), "10m ago");
+  assert.equal(formatStaleAge(nowS - 36 * 60, nowS), "36m ago");
+  assert.equal(formatStaleAge(nowS - 2 * 3600, nowS), "2h ago");
+  assert.equal(formatStaleAge(nowS - 26 * 3600, nowS), "1d ago");
+
+  const entries = [{ result: {
+    installed: { claude: true, agy: true },
+    limits: {
+      claude: { five: { remaining: 50, resets_at: nowS + 3600 }, read_at: nowS - 36 * 60 },
+      antigravity: {
+        five: { remaining: 80, resets_at: nowS + 3600 },
+        read_at: nowS - 5 * 60,
+      },
+    },
+  } }];
+  const rows = buildUsageRows(entries, now);
+  assert.equal(rows.find((r) => r.id === "claude")?.staleAge, "36m ago");
+  assert.equal(rows.find((r) => r.id === "antigravity")?.staleAge, undefined);
 });
 
 test("live collector shape keeps Codex 30d window and installed OpenCode through validation", () => {
@@ -1607,4 +1635,51 @@ test("buildMachineModels folds a Tailscale peer into the Herdr machine named by 
   assert.equal(win.inTailscale, true);
   assert.equal(win.pingMs, 8);
   assert.equal(models.find((m) => m.key === "build-server").inTailscale, false);
+});
+
+test("all SIZES and PALETTE references in mods/ are valid keys in palette.js", async () => {
+  const { readdirSync, statSync, readFileSync } = await import("node:fs");
+  const { join, resolve } = await import("node:path");
+  const { SIZES, PALETTE } = await import("./palette.js");
+
+  const validSizes = new Set(Object.keys(SIZES));
+  const validPalette = new Set(Object.keys(PALETTE));
+
+  const modsDir = resolve("mods");
+  const jsFiles = [];
+
+  function collectJs(dir) {
+    for (const entry of readdirSync(dir)) {
+      const fullPath = join(dir, entry);
+      const st = statSync(fullPath);
+      if (st.isDirectory()) {
+        collectJs(fullPath);
+      } else if (entry.endsWith(".js")) {
+        jsFiles.push(fullPath);
+      }
+    }
+  }
+
+  collectJs(modsDir);
+  assert(jsFiles.length > 0, "Expected to find .js files in mods/");
+
+  const invalidRefs = [];
+
+  for (const file of jsFiles) {
+    const code = readFileSync(file, "utf8");
+    for (const match of code.matchAll(/\bSIZES\.(\w+)/g)) {
+      const key = match[1];
+      if (!validSizes.has(key)) {
+        invalidRefs.push(`${file}: invalid SIZES.${key}`);
+      }
+    }
+    for (const match of code.matchAll(/\bPALETTE\.(\w+)/g)) {
+      const key = match[1];
+      if (!validPalette.has(key)) {
+        invalidRefs.push(`${file}: invalid PALETTE.${key}`);
+      }
+    }
+  }
+
+  assert.deepEqual(invalidRefs, []);
 });

@@ -46,7 +46,15 @@ MAX_PROBE_BYTES = 256 * 1024
 DOCKER_PS_FIELDS = ("ID", "Names", "Name", "Image", "State", "Status", "Ports")
 DOCKER_STATS_FIELDS = ("ID", "Container", "Name", "CPUPerc", "MemUsage", "MemPerc", "NetIO")
 AGY_TIMEOUT = 20
-AGY_CACHE_TTL_S = 3600
+AGY_CACHE_TTL_WINDOWS_S = 3600
+AGY_CACHE_TTL_UNIX_S = 300
+AGY_CACHE_TTL_S = AGY_CACHE_TTL_WINDOWS_S if IS_WINDOWS else AGY_CACHE_TTL_UNIX_S
+AGY_PROBE_COOLDOWN_S = 60
+
+
+def agy_cache_ttl_seconds(is_windows=None):
+    win = IS_WINDOWS if is_windows is None else is_windows
+    return AGY_CACHE_TTL_WINDOWS_S if win else AGY_CACHE_TTL_UNIX_S
 LIMIT_PROVIDERS = ("claude", "codex", "antigravity", "opencode")
 RETENTION_DAYS = 31
 NETWORK_RETENTION_DAYS = 62
@@ -2468,11 +2476,47 @@ def _parse_agy_limits(payload, read_at):
     return _limit_record(windows, read_at, source="cli")
 
 
-def _probe_agy_limits(cache_dir, now, errors):
+def _latest_antigravity_activity(agy_root):
+    """Find the newest mtime among Antigravity conversation databases."""
+    conv_dir = agy_root / "conversations"
+    newest = None
+    try:
+        _checked_path(conv_dir, stat.S_ISDIR)
+        with os.scandir(conv_dir) as it:
+            for entry in it:
+                if not entry.name.endswith(".db"):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if _is_link(st) or not stat.S_ISREG(st.st_mode):
+                    continue
+                if newest is None or st.st_mtime > newest:
+                    newest = st.st_mtime
+    except (FileNotFoundError, OSError):
+        pass
+    return newest
+
+
+def _probe_agy_limits(cache_dir, now, errors, agy_root=None):
     path = cache_dir / "antigravity-quota.json"
     cached = _read_cache(path)
     fetched_at = cached.get("fetched_at") if isinstance(cached, dict) else None
-    if _number(fetched_at) and 0 <= now - fetched_at < AGY_CACHE_TTL_S:
+    ttl = agy_cache_ttl_seconds()
+
+    # If agy activity is newer than the cached quota read, treat cache as stale,
+    # but respect a minimum probe interval of AGY_PROBE_COOLDOWN_S (60s).
+    has_recent_probe = _number(fetched_at) and 0 <= now - fetched_at < AGY_PROBE_COOLDOWN_S
+    if has_recent_probe:
+        if "limits" in cached:
+            return cached["limits"]
+        return _parse_agy_limits(cached.get("data"), fetched_at)
+
+    latest_activity = _latest_antigravity_activity(agy_root) if agy_root else None
+    activity_newer = _number(fetched_at) and _number(latest_activity) and latest_activity > fetched_at
+
+    if _number(fetched_at) and 0 <= now - fetched_at < ttl and not activity_newer:
         if "limits" in cached:
             return cached["limits"]
         return _parse_agy_limits(cached.get("data"), fetched_at)
@@ -2504,7 +2548,7 @@ def collect_limits(cache_dir, errors, home=None, now=None, *, notes=None):
     claude = _fresh_limits_file(claude_dir / "limits-claude.json", now, 6 * 3600)
     agy = _fresh_limits_file(claude_dir / "limits.json", now, 3600)
     if agy is None:
-        antigravity = _probe_agy_limits(cache_dir, now, errors)
+        antigravity = _probe_agy_limits(cache_dir, now, errors, agy_root=home / ".gemini" / "antigravity-cli")
     else:
         groups = agy.get("agy")
         antigravity = _limit_record(groups.get("gemini"), agy["at"]) if isinstance(groups, dict) else None

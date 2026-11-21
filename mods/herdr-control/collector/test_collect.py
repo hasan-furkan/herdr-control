@@ -547,6 +547,13 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(collect.collect_limits(self.cache, [], self.home, self.now),
                              dict.fromkeys(collect.LIMIT_PROVIDERS))
 
+    def test_agy_cache_ttl_constants_and_function(self):
+        self.assertEqual(collect.AGY_CACHE_TTL_WINDOWS_S, 3600)
+        self.assertEqual(collect.AGY_CACHE_TTL_UNIX_S, 300)
+        self.assertEqual(collect.AGY_PROBE_COOLDOWN_S, 60)
+        self.assertEqual(collect.agy_cache_ttl_seconds(is_windows=True), 3600)
+        self.assertEqual(collect.agy_cache_ttl_seconds(is_windows=False), 300)
+
     def test_agy_opt_in_probe_caches_failures(self):
         with patch.object(collect, "IS_WINDOWS", True), patch.dict(os.environ, {"HERDR_CONTROL_AGY_PROBE": "1"}), \
                 patch.object(collect.shutil, "which", return_value="agy"), \
@@ -556,6 +563,57 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             collect.collect_limits(self.cache, [], self.home, self.now + 3600)
             self.assertEqual(run.call_count, 2)
+
+    def test_agy_probe_cooldown_on_unix(self):
+        with patch.object(collect, "IS_WINDOWS", False), \
+                patch.object(collect.shutil, "which", return_value="agy"), \
+                patch.object(collect, "_run", side_effect=OSError) as run:
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now)["antigravity"])
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now + 299)["antigravity"])
+            self.assertEqual(run.call_count, 1)
+            collect.collect_limits(self.cache, [], self.home, self.now + 300)
+            self.assertEqual(run.call_count, 2)
+
+    def test_agy_probe_re_probes_on_new_activity_with_rate_limit(self):
+        conv_dir = self.home / ".gemini" / "antigravity-cli" / "conversations"
+        conv_dir.mkdir(parents=True)
+        db_file = conv_dir / "session.db"
+        db_file.touch()
+        os.utime(db_file, (self.now - 100, self.now - 100))
+
+        with patch.object(collect, "IS_WINDOWS", False), \
+                patch.object(collect.shutil, "which", return_value="agy"), \
+                patch.object(collect, "_run", side_effect=OSError) as run:
+            # 1. Initial probe at self.now (activity was at now - 100). Probe records fetched_at = self.now.
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now)["antigravity"])
+            self.assertEqual(run.call_count, 1)
+
+            # 2. Idle state: no new activity, within TTL (300s) -> no probe.
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now + 100)["antigravity"])
+            self.assertEqual(run.call_count, 1)
+
+            # 3. New activity occurs at now + 30 (which is newer than fetched_at = now).
+            os.utime(db_file, (self.now + 30, self.now + 30))
+
+            # But check at now + 40 (< 60s cooldown from last probe at now) -> no probe.
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now + 40)["antigravity"])
+            self.assertEqual(run.call_count, 1)
+
+            # Check at now + 60 (>= 60s cooldown, activity at now+30 > fetched_at=now) -> re-probe!
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now + 60)["antigravity"])
+            self.assertEqual(run.call_count, 2)
+
+    def test_agy_probe_windows_no_probe_even_with_new_activity(self):
+        conv_dir = self.home / ".gemini" / "antigravity-cli" / "conversations"
+        conv_dir.mkdir(parents=True)
+        db_file = conv_dir / "session.db"
+        db_file.touch()
+        os.utime(db_file, (self.now + 10, self.now + 10))
+
+        with patch.object(collect, "IS_WINDOWS", True), patch.dict(os.environ, {}, clear=True), \
+                patch.object(collect.shutil, "which", return_value="agy"), \
+                patch.object(collect, "_run", side_effect=AssertionError("probe should not run on Windows")):
+            self.assertIsNone(collect.collect_limits(self.cache, [], self.home, self.now)["antigravity"])
 
     def test_agy_probe_parser_selects_gemini(self):
         reply = {"command": {"data": {"groups": [

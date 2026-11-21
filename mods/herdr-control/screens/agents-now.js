@@ -538,7 +538,12 @@ function buildQuotasCard({ ui, palette, collectEntries, narrow }) {
       .bg(PALETTE.rowBg)
       .border(1)
       .border_color(PALETTE.line)
-      .child(div().text_size(SIZES.sm).font_bold().text_color(PALETTE.text).child(row.label))
+      .child(
+        h_flex().w_full().justify_between().items_baseline().gap(4)
+          .child(div().text_size(SIZES.sm).font_bold().text_color(PALETTE.text).child(row.label))
+          .when(Boolean(row.staleAge), (el) =>
+            el.child(div().text_size(SIZES.xs).font_family(monoFont()).text_color(PALETTE.muted).child(row.staleAge))),
+      )
       .children((row.windows?.length ? row.windows : [{ label: "5h", remaining: row.five, countdown: row.countdown }, { label: "week", remaining: row.week, countdown: "—" }]).map(({ label, remaining: value, countdown }) =>
         value === null
           ? div().text_size(SIZES.xs).font_family(monoFont()).text_color(PALETTE.muted).child(`${label} · —`)

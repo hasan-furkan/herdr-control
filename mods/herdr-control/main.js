@@ -153,7 +153,12 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
       .text_size(SIZES.xs)
       .child(
         h_flex().w_full().justify_between().gap(4)
-          .child(div().font_semibold().text_color(PALETTE.text).child(row.label))
+          .child(
+            h_flex().items_baseline().gap(4)
+              .child(div().font_semibold().text_color(PALETTE.text).child(row.label))
+              .when(Boolean(row.staleAge), (el) =>
+                el.child(div().text_size(SIZES.xs).font_family(monoFont()).text_color(PALETTE.muted).child(row.staleAge))),
+          )
           .child(div().flex_none().whitespace_nowrap().font_family(monoFont()).text_color(PALETTE.muted)
             .tooltip(row.id === "antigravity" ? "Today's tokens (estimated)" : "Today's tokens")
             .child(row.tokens)),

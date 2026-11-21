@@ -147,7 +147,7 @@ herdr-app do tab.new --mod herdr-control --name "Herdr Control"
 - **Monthly traffic** — Set `TRAFFIC_LIMITS` in `mods/herdr-control/limits.js`, keyed by the machine name shown in Herdr or Tailscale. Set `monthly_tb`, `count` (`"total"` for download plus upload, `"out"` for upload only), and `billing_day` to match your billing period.
 - **Agent catalog** — Add `mods/herdr-control/catalog.local.js` to customize the agent roster. See the [local catalog guide](docs/local-catalog.md).
 - **Phrasebook** — Set `HERDR_CONTROL_PHRASES_FILE` in the Herdr app's environment to the path of a readable Markdown file.
-- **Antigravity quota probe** — When the optional quota snapshot is missing or stale, the collector can run `agy -p /usage --output-format json` if `agy` is on `PATH`. On Windows this requires `HERDR_CONTROL_AGY_PROBE=1` in the app's environment. The probe has a one-hour cooldown.
+- **Antigravity quota probe** — When the optional quota snapshot is missing or stale, the collector can run `agy -p /usage --output-format json` if `agy` is on `PATH`. On Windows this requires `HERDR_CONTROL_AGY_PROBE=1` in the app's environment. The probe has a cooldown of 3600 s on Windows and 300 s on macOS/Linux, and re-probes on new agy activity every 60 s at most.
 - **Optional quota snapshots** — `~/.claude/limits-claude.json` supplies Claude Code quotas for up to six hours and `~/.claude/limits.json` supplies Antigravity's Gemini quotas for up to one hour. An external tool or user-managed script must write these files. Herdr Control only reads them, and this project ships no snapshot writer.
 
 ## What data it reads
