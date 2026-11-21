@@ -1,8 +1,12 @@
-# Install Herdr Control
+# Herdr Control
+
+A control room for Herdr: a sidebar and dashboard with today's agent activity, who is running where, token usage and limits for Claude Code, Codex, Antigravity and OpenCode, your Tailscale machines, open ports and pending approvals. Streaming mode hides names, paths and IPs.
+
+![Herdr Control (demo data)](preview.png)
+
+## Install
 
 Read the user's Herdr app `AGENTS.md` first. Use its config directory, normally `~/.config/herdr-app`. Herdr desktop needs JavaScript mods, layouts, and peer `exec` support. Live collection requires Python 3.9+ on the local machine and each monitored peer. Demo data needs no Python.
-
-[Layout illustration (demo data)](preview.png)
 
 Ask the user to choose **Option A: Layout** or **Option B: Mod only** if their request leaves the choice open.
 
