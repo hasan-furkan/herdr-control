@@ -317,7 +317,11 @@ export function buildUsageRows(entries, now = new Date()) {
         remaining: value.remaining,
         resets_at: value.resets_at,
         countdown: formatResetCountdown(value.resets_at, nowS),
-      }));
+      }))
+      .sort((a, b) => {
+        const priority = (label) => label === "5h" ? 0 : label === "week" ? 1 : 2;
+        return priority(a.label) - priority(b.label);
+      });
     const fiveWindow = windows.find((window) => window.label === "5h");
     const weekWindow = windows.find((window) => window.label === "week");
     const countdown = fiveWindow?.countdown ?? "—";

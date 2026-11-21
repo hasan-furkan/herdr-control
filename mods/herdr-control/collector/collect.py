@@ -2004,10 +2004,10 @@ def _decode_agy_metadata(blob):
 
 
 def _read_agy_db(path, date_str, budget):
-    by_model = {}
-    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0)) as conn:
-        conn.set_progress_handler(budget.expired, 1000)
-        try:
+    def read_with_uri(uri):
+        rows = {}
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as conn:
+            conn.set_progress_handler(budget.expired, 1000)
             cursor = conn.execute(
                 "SELECT CASE WHEN length(data) <= ?1 THEN data END, length(data) > ?1 FROM gen_metadata",
                 (MAX_LOG_LINE_BYTES,),
@@ -2025,7 +2025,7 @@ def _read_agy_db(path, date_str, budget):
                 if not (input_tokens or output_tokens or cache_read):
                     continue
                 model = str(values.get("model", ""))
-                row = by_model.setdefault(model, {
+                row = rows.setdefault(model, {
                     "date": date_str,
                     "provider": "antigravity",
                     "model": model,
@@ -2040,15 +2040,23 @@ def _read_agy_db(path, date_str, budget):
                 row["input"] += input_tokens
                 row["output"] += output_tokens
                 row["cache_read"] += cache_read
-        except sqlite3.Error:
-            budget.check()
-            raise
+        return rows
+
+    by_model = None
+    try:
+        try:
+            by_model = read_with_uri(path.as_uri() + "?mode=ro")
+        except sqlite3.OperationalError:
+            by_model = read_with_uri(path.as_uri() + "?mode=ro&immutable=1")
+    except sqlite3.Error:
+        budget.check()
+        raise
 
     if by_model:
         # A conversation with several models still counts as one session.
         primary = max(by_model.values(), key=lambda row: row["input"] + row["output"] + row["cache_read"])
         primary["sessions"] = 1
-    return list(by_model.values())
+    return list(by_model.values()) if by_model else []
 
 
 def _collect_antigravity_sessions(agy_root, cache, cutoff_ts, cutoff_date, now, errors, notes):

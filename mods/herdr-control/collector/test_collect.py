@@ -455,6 +455,32 @@ class CollectorTests(unittest.TestCase):
         with patch.object(collect, "_read_agy_db", side_effect=sqlite3.OperationalError("database is locked")):
             self.assertEqual(collect._collect_antigravity_sessions(root, {}, *args[2:]), ([], live))
 
+    def test_agy_db_reads_wal_database_without_wal_file(self):
+        root = self.home / "antigravity_wal"
+        path = root / "conversations" / "orphan_wal.db"
+        path.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)")
+            conn.executemany("INSERT INTO gen_metadata VALUES (?, ?)", [(1, metadata()), (2, metadata(False))])
+            conn.commit()
+        wal = path.with_name(path.name + "-wal")
+        shm = path.with_name(path.name + "-shm")
+        if wal.exists():
+            wal.unlink()
+        if shm.exists():
+            shm.unlink()
+        os.utime(path, (self.now, self.now))
+        cutoff_day = collect._epoch_to_local_date(self.now)
+        cache = {}
+        args = (root, cache, self.now - 86400, cutoff_day, self.now, [], [])
+        rows, live = collect._collect_antigravity_sessions(*args)
+        self.assertEqual(rows, [{
+            "date": cutoff_day, "provider": "antigravity", "model": "1320",
+            "input": 5230, "output": 806, "cache_read": 6981, "cache_write": 0,
+            "sessions": 1, "active_s": 0, "estimated": True, "project": "",
+        }])
+
     def test_codex_limits_use_latest_log_and_cache_before_expiration(self):
         path = self.home / ".codex" / "sessions" / "2026" / "session.jsonl"
         path.parent.mkdir(parents=True)

@@ -746,6 +746,30 @@ test("usage rows include installed providers with no tokens and keep Codex windo
   assert.deepEqual(buildUsageRows([{ result: { installed: { opencode: false } } }], now), []);
 });
 
+test("usage windows are always ordered 5h, week, then longer windows for every provider", () => {
+  const now = new Date("2026-11-21T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+  const entries = [{ result: {
+    installed: { claude: true, codex: true, agy: true },
+    limits: {
+      antigravity: {
+        week: { remaining: 90, resets_at: nowS + 86400 },
+        five: { remaining: 75, resets_at: nowS + 3600 },
+      },
+      codex: {
+        month: { remaining: 20, resets_at: nowS + 30 * 86400, window_minutes: 43200 },
+        week: { remaining: 60, resets_at: nowS + 7 * 86400, window_minutes: 10080 },
+        five: { remaining: 80, resets_at: nowS + 3600, window_minutes: 300 },
+      },
+    },
+  } }];
+  const rows = buildUsageRows(entries, now);
+  const agy = rows.find((row) => row.id === "antigravity");
+  assert.deepEqual(agy.windows.map((w) => w.label), ["5h", "week"]);
+  const codex = rows.find((row) => row.id === "codex");
+  assert.deepEqual(codex.windows.map((w) => w.label), ["5h", "week", "30d"]);
+});
+
 test("formatStaleAge and usage rows show staleness when limits are older than 10 minutes", () => {
   const now = new Date("2026-11-21T12:00:00Z");
   const nowS = now.getTime() / 1000;
