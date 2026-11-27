@@ -57,6 +57,16 @@ class CollectorTests(unittest.TestCase):
         saved_key = os.environ.pop("OPENCODE_GO_API_KEY", None)
         if saved_key is not None:
             self.addCleanup(os.environ.__setitem__, "OPENCODE_GO_API_KEY", saved_key)
+        for name in (
+            "HERDR_CONTROL_OPENCODE_KEY_LOOKUP",
+            "XDG_DATA_HOME",
+            "OPENCODE_DB",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ):
+            saved = os.environ.pop(name, None)
+            if saved is not None:
+                self.addCleanup(os.environ.__setitem__, name, saved)
 
     def test_ssh_config_hosts_collect_only_literal_aliases(self):
         config = self.home / ".ssh" / "config"
@@ -683,7 +693,7 @@ class CollectorTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), \
                 patch.object(collect, "_opencode_fetch_body", side_effect=AssertionError("request")), \
                 patch.object(collect.urllib.request, "urlopen", side_effect=AssertionError("urllib")):
-            self.assertIsNone(collect.opencode_usage(self.cache, self.now, errors))
+            self.assertIsNone(collect.opencode_usage(self.cache, self.now, errors, home=self.home))
         self.assertEqual(errors, [])
         self.assertFalse((self.cache / "opencode-usage.json").exists())
 
@@ -694,8 +704,8 @@ class CollectorTests(unittest.TestCase):
         second_body = json.dumps(self.opencode_body(rolling=5)).encode()
         with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": key}, clear=True), \
                 patch.object(collect, "_opencode_fetch_body", return_value=first_body) as fetch:
-            first = collect.opencode_usage(self.cache, self.now, errors)
-            second = collect.opencode_usage(self.cache, self.now + 59, errors)
+            first = collect.opencode_usage(self.cache, self.now, errors, home=self.home)
+            second = collect.opencode_usage(self.cache, self.now + 59, errors, home=self.home)
         self.assertEqual(fetch.call_count, 1)
         self.assertEqual(first, second)
         self.assertEqual(first["read_at"], self.now)
@@ -704,7 +714,7 @@ class CollectorTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": key}, clear=True), \
                 patch.object(collect, "_opencode_fetch_body", return_value=second_body) as fetch:
-            third = collect.opencode_usage(self.cache, self.now + 60, errors)
+            third = collect.opencode_usage(self.cache, self.now + 60, errors, home=self.home)
         self.assertEqual(fetch.call_count, 1)
         self.assertEqual(third["five"]["remaining"], 95.0)
         self.assertEqual(third["read_at"], self.now + 60)
@@ -728,14 +738,14 @@ class CollectorTests(unittest.TestCase):
         errors = []
         with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "fake-key"}, clear=True), \
                 patch.object(collect, "_opencode_fetch_body", side_effect=TimeoutError):
-            self.assertIsNone(collect.opencode_usage(self.cache, self.now, errors))
+            self.assertIsNone(collect.opencode_usage(self.cache, self.now, errors, home=self.home))
         self.assertEqual(errors, ["opencode usage: timeout"])
 
         errors = []
         body = json.dumps(self.opencode_body(rolling=101)).encode()
         with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "fake-key"}, clear=True), \
                 patch.object(collect, "_opencode_fetch_body", return_value=body):
-            self.assertIsNone(collect.opencode_usage(self.cache, self.now + 120, errors))
+            self.assertIsNone(collect.opencode_usage(self.cache, self.now + 120, errors, home=self.home))
         self.assertEqual(errors, ["opencode usage: invalid response"])
 
     def test_opencode_api_windows_keep_an_active_log_signal(self):
@@ -754,6 +764,214 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(result["source"], "api")
         self.assertEqual(result["five"]["remaining"], 99.0)
         self.assertEqual(result["reached"], {"window": "monthly", "resets_at": epoch + 6 * 86400})
+
+    def credential_row(self, credential_id, provider, value, active=1, updated=None):
+        updated = self.now if updated is None else updated
+        return (
+            credential_id,
+            provider,
+            provider,
+            json.dumps(value),
+            None,
+            None,
+            active,
+            updated,
+            updated,
+        )
+
+    def write_opencode_store(self, rows, name="opencode.db", root=None):
+        root = root or (self.home / ".local" / "share" / "opencode")
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / name
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute(
+                "CREATE TABLE credential ("
+                "id text PRIMARY KEY, integration_id text, label text NOT NULL, value text NOT NULL, "
+                "connector_id text, method_id text, active integer, time_created INTEGER NOT NULL, "
+                "time_updated INTEGER NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO credential (id, integration_id, label, value, connector_id, method_id, "
+                "active, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        return path
+
+    def test_opencode_go_store_reads_only_the_go_api_key(self):
+        key = "sk-fake-GO-STORE-0001"
+        path = self.write_opencode_store([
+            self.credential_row("go", "opencode-go", {"type": "key", "key": key}),
+            self.credential_row("router", "openrouter", {"type": "key", "key": "sk-fake-OTHER-ROUTER"}),
+            self.credential_row("oc", "opencode", {"type": "key", "key": "sk-fake-OTHER-OPENCODE"}),
+        ])
+        rows, state = collect._read_opencode_credentials(path)
+        self.assertEqual(state, "ok")
+        self.assertEqual([row["provider"] for row in rows], ["opencode-go"])
+        notes = []
+        with patch.dict(os.environ, {}, clear=True):
+            token, info = collect.opencode_go_token(self.home, notes)
+        self.assertEqual(token, key)
+        self.assertEqual(info, {"source": "store", "type": "key"})
+        self.assertEqual(notes, [])
+
+    def test_opencode_go_oauth_and_console_rows_are_ignored(self):
+        path = self.write_opencode_store([
+            self.credential_row("go", "opencode-go", {
+                "type": "oauth", "access": "fake-access", "refresh": "fake-refresh", "expires": self.now,
+            }),
+        ])
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute(
+                "CREATE TABLE account (id text PRIMARY KEY, email text NOT NULL, url text NOT NULL, "
+                "access_token text NOT NULL, refresh_token text NOT NULL, token_expiry integer, "
+                "time_created integer NOT NULL, time_updated integer NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO account VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("console", "user@example.test", "https://console.example.test", "console-token", "refresh", 0, self.now, self.now),
+            )
+            conn.commit()
+        self.write_json(".local/share/opencode/auth.json", {
+            "opencode-go": {"type": "api", "key": "sk-fake-GO-LEGACY-0012"},
+        })
+        with patch.dict(os.environ, {}, clear=True):
+            token, info = collect.opencode_go_token(self.home)
+        self.assertIsNone(token)
+        self.assertEqual(info, {"source": "store", "type": "oauth"})
+
+    def test_opencode_go_legacy_auth_json_is_the_last_fallback(self):
+        key = "sk-fake-GO-LEGACY-0002"
+        self.write_json(".local/share/opencode/auth.json", {
+            "opencode-go": {"type": "api", "key": key},
+            "openrouter": {"type": "api", "key": "sk-fake-OTHER-ROUTER"},
+        })
+        with patch.dict(os.environ, {}, clear=True):
+            token, info = collect.opencode_go_token(self.home)
+        self.assertEqual(token, key)
+        self.assertEqual(info, {"source": "auth.json", "type": "api"})
+
+    def test_opencode_go_key_lookup_can_be_disabled(self):
+        self.write_opencode_store([
+            self.credential_row("go", "opencode-go", {"type": "key", "key": "sk-fake-GO-STORE-0003"}),
+        ])
+        with patch.dict(os.environ, {"HERDR_CONTROL_OPENCODE_KEY_LOOKUP": "0"}, clear=True):
+            token, info = collect.opencode_go_token(self.home)
+        self.assertIsNone(token)
+        self.assertEqual(info, {"source": "disabled", "type": "none"})
+
+        env_key = "sk-fake-ENV-0004"
+        with patch.dict(os.environ, {
+            "HERDR_CONTROL_OPENCODE_KEY_LOOKUP": "0",
+            "OPENCODE_GO_API_KEY": env_key,
+        }, clear=True):
+            token, info = collect.opencode_go_token(self.home)
+        self.assertEqual(token, env_key)
+        self.assertEqual(info, {"source": "env", "type": "api"})
+
+    def test_opencode_go_env_key_has_priority_over_local_sources(self):
+        self.write_opencode_store([
+            self.credential_row("go", "opencode-go", {"type": "key", "key": "sk-fake-GO-STORE-0005"}),
+        ])
+        self.write_json(".local/share/opencode/auth.json", {
+            "opencode-go": {"type": "api", "key": "sk-fake-GO-LEGACY-0006"},
+        })
+        env_key = "sk-fake-ENV-0007"
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": env_key}, clear=True):
+            token, info = collect.opencode_go_token(self.home)
+        self.assertEqual(token, env_key)
+        self.assertEqual(info, {"source": "env", "type": "api"})
+
+    def test_opencode_go_unknown_credential_schema_adds_one_note(self):
+        root = self.home / ".local" / "share" / "opencode"
+        root.mkdir(parents=True)
+        with closing(sqlite3.connect(root / "opencode.db")) as conn:
+            conn.execute("CREATE TABLE credential (id text PRIMARY KEY, integration_id text, label text)")
+            conn.commit()
+        notes = []
+        with patch.dict(os.environ, {}, clear=True):
+            token, info = collect.opencode_go_token(self.home, notes)
+        self.assertIsNone(token)
+        self.assertEqual(info, {"source": "none", "type": "none"})
+        self.assertEqual(notes, ["opencode key lookup: unknown credential schema"])
+
+    def test_opencode_go_missing_credential_table_adds_one_note(self):
+        root = self.home / ".local" / "share" / "opencode"
+        root.mkdir(parents=True)
+        with closing(sqlite3.connect(root / "opencode.db")) as conn:
+            conn.execute("CREATE TABLE message (id text PRIMARY KEY)")
+            conn.commit()
+        notes = []
+        with patch.dict(os.environ, {}, clear=True):
+            token, info = collect.opencode_go_token(self.home, notes)
+        self.assertIsNone(token)
+        self.assertEqual(info, {"source": "none", "type": "none"})
+        self.assertEqual(notes, ["opencode key lookup: credential table not found"])
+
+    def test_opencode_go_store_key_is_used_but_never_serialized(self):
+        key = "sk-fake-GO-STORE-SECRET-0008"
+        self.write_opencode_store([
+            self.credential_row("go", "opencode-go", {"type": "key", "key": key}),
+        ])
+        errors, notes = [], []
+        captured = {}
+        body = json.dumps(self.opencode_body()).encode()
+
+        def fake_fetch(token):
+            captured["token"] = token
+            return body
+
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", side_effect=fake_fetch):
+            limits = collect.opencode_limits(self.home, self.now, self.cache, errors, notes)
+        self.assertEqual(captured["token"], key)
+        self.assertEqual(limits["source"], "api")
+        self.assertEqual(errors, [])
+        self.assertEqual(notes, [])
+        self.assertNotIn(key, json.dumps({"limits": limits, "errors": errors, "notes": notes}))
+        self.assertNotIn(key, (self.cache / "opencode-usage.json").read_text(encoding="utf-8"))
+
+        errors, notes = [], []
+        failure = urllib.error.HTTPError(collect.OPENCODE_USAGE_URL, 401, "Unauthorized", {}, None)
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", side_effect=failure):
+            self.assertIsNone(collect.opencode_limits(self.home, self.now + 61, self.cache, errors, notes))
+        self.assertEqual(errors, ["opencode usage: HTTP 401"])
+        self.assertNotIn(key, json.dumps({"errors": errors, "notes": notes}))
+        self.assertNotIn(key, (self.cache / "opencode-usage.json").read_text(encoding="utf-8"))
+
+    def test_opencode_go_store_honors_xdg_data_home_opencode_db_and_channel_names(self):
+        key = "sk-fake-GO-XDG-0009"
+        xdg = self.home / "xdg"
+        self.write_opencode_store(
+            [self.credential_row("go", "opencode-go", {"type": "key", "key": key})],
+            root=xdg / "opencode",
+        )
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg)}, clear=True):
+            token, _ = collect.opencode_go_token(self.home)
+        self.assertEqual(token, key)
+
+        absolute = self.home / "custom" / "go.db"
+        self.write_opencode_store(
+            [self.credential_row("go", "opencode-go", {"type": "key", "key": "sk-fake-GO-ABSOLUTE-0010"})],
+            root=absolute.parent,
+            name=absolute.name,
+        )
+        with patch.dict(os.environ, {"OPENCODE_DB": str(absolute)}, clear=True):
+            token, _ = collect.opencode_go_token(self.home)
+        self.assertEqual(token, "sk-fake-GO-ABSOLUTE-0010")
+
+        relative = "opencode-dev.db"
+        self.write_opencode_store(
+            [self.credential_row("go", "opencode-go", {"type": "key", "key": "sk-fake-GO-CHANNEL-0011"})],
+            name=relative,
+        )
+        with patch.dict(os.environ, {
+            "OPENCODE_DB": relative,
+            "XDG_DATA_HOME": str(self.home / ".local" / "share"),
+        }, clear=True):
+            token, _ = collect.opencode_go_token(self.home)
+        self.assertEqual(token, "sk-fake-GO-CHANNEL-0011")
 
     def test_limits_file_staleness_and_windows_default(self):
         limits = {"five": {"remaining": 87.0, "resets_at": None}, "week": None}

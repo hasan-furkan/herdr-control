@@ -147,9 +147,23 @@ herdr-app do tab.new --mod herdr-control --name "Herdr Control"
 - **Monthly traffic** — Set `TRAFFIC_LIMITS` in `mods/herdr-control/limits.js`, keyed by the machine name shown in Herdr or Tailscale. Set `monthly_tb`, `count` (`"total"` for download plus upload, `"out"` for upload only), and `billing_day` to match your billing period.
 - **Agent catalog** — Add `mods/herdr-control/catalog.local.js` to customize the agent roster. See the [local catalog guide](docs/local-catalog.md).
 - **Phrasebook** — Set `HERDR_CONTROL_PHRASES_FILE` in the Herdr app's environment to the path of a readable Markdown file.
-- **OpenCode Go quota** — Set `OPENCODE_GO_API_KEY` in the Herdr app's environment (on Windows this is a user environment variable; on macOS the variable must be visible to the app). The collector sends the key only to `https://opencode.ai/inference/go/v1/usage` with a 5 s timeout, keeps at most one request per 60 s, and caches the last good response for 60 s. It never reads OpenCode credential files and never writes the key to its cache, logs, errors, or dashboard output. Without the key it makes no request and the OpenCode row keeps the spend estimate.
+- **OpenCode Go quota** — The collector finds a Go API key in OpenCode's local credential store, or uses `OPENCODE_GO_API_KEY` when set. See [OpenCode Go quota](#opencode-go-quota) for the lookup order, the one host that receives the key, and how to turn the local lookup off.
 - **Antigravity quota probe** — When the optional quota snapshot is missing or stale, the collector can run `agy -p /usage --output-format json` if `agy` is on `PATH`. On Windows this requires `HERDR_CONTROL_AGY_PROBE=1` in the app's environment. The probe has a cooldown of 3600 s on Windows and 300 s on macOS/Linux, and re-probes on new agy activity every 60 s at most.
 - **Optional quota snapshots** — `~/.claude/limits-claude.json` supplies Claude Code quotas for up to six hours and `~/.claude/limits.json` supplies Antigravity's Gemini quotas for up to one hour. An external tool or user-managed script must write these files. Herdr Control only reads them, and this project ships no snapshot writer.
+
+### OpenCode Go quota
+
+The collector looks for an OpenCode Go API key in this order:
+
+1. `OPENCODE_GO_API_KEY` in the Herdr app's environment.
+2. OpenCode's local credential store in its SQLite database. The collector opens the database read-only, inspects the schema, and reads only the `opencode-go` row when its stored type is an API key. OAuth and OpenCode Console tokens and other provider rows are ignored. The path comes from `opencode debug paths db`; it usually follows `XDG_DATA_HOME`, the release-channel database name, or `OPENCODE_DB`, and defaults to `~/.local/share/opencode/opencode.db`.
+3. The legacy `auth.json` in the same data directory, entry `opencode-go` with `{"type":"api","key":...}`, only when the credential store has no Go row.
+
+The key stays in memory for the request. It is sent only to `https://opencode.ai/inference/go/v1/usage` with a 5 s timeout; the collector makes at most one request per 60 s and caches the normalized response for 60 s without the key. The key is never written to the cache, logs, errors, notes, or dashboard output. `--remote` runs never call the endpoint.
+
+Set `HERDR_CONTROL_OPENCODE_KEY_LOOKUP=0` in the app's environment to skip the local store and legacy `auth.json` lookup. `OPENCODE_GO_API_KEY` still wins when it is set. If no key is found, no request is made and the OpenCode row keeps the spend estimate.
+
+If you do not have a stored Go key, connect once: run `/connect`, choose **OpenCode Go**, and paste the key. From the CLI, run `opencode auth login opencode-go --method key`.
 
 ## What data it reads
 
@@ -158,13 +172,13 @@ The collector reads these agent sources on the machine running the full collecti
 | Agent tool | Local paths | Data used |
 | --- | --- | --- |
 | Claude Code | `~/.claude/projects/**/*.jsonl`, `~/.claude/limits-claude.json` | Token counts and model, session, time, and project metadata, plus the optional quota snapshot |
-| OpenCode | `~/.local/share/opencode/opencode.db`, `~/.local/share/opencode/log/opencode.log`; optional `OPENCODE_GO_API_KEY` | Message token counts and associated metadata from SQLite, recent OpenCode Go quota errors and reset times from the log, and live Go quota percentages from opencode.ai when the key is set |
+| OpenCode | `~/.local/share/opencode/opencode.db`, `~/.local/share/opencode/auth.json`, `~/.local/share/opencode/log/opencode.log`; optional `OPENCODE_GO_API_KEY` | Message token counts and associated metadata from SQLite, the stored Go API key when present, recent OpenCode Go quota errors and reset times from the log, and live Go quota percentages from opencode.ai when a key is found |
 | Codex | `~/.codex/sessions/**/*.jsonl` | Token-count events and recent rate-limit records |
 | Antigravity | `~/.gemini/antigravity-cli/conversations/*.db`, `~/.gemini/antigravity-cli/cache/last_conversations.json`, `~/.claude/limits.json` | Inferred token and model metadata, recent conversation and workspace associations, and the optional Gemini quota snapshot |
 
 Agent logs, databases, and quota snapshots are read-only inputs. The collector keeps its own caches in `%LOCALAPPDATA%\herdr-control\` on Windows and `~/.cache/herdr-control/` on macOS and Linux. Herdr supplies live spaces, terminals, agents, and machine state. The dashboard also reads host metrics, listening ports, and available Tailscale, Docker, and network data.
 
-Agent usage and quota files stay on the machine, and the mod has no telemetry upload service. With `OPENCODE_GO_API_KEY`, the collector makes an HTTPS quota request to opencode.ai; the key is sent only to that host and is not written to caches, logs, errors, or output. Herdr runs the collector on ready peer machines with `--remote` and receives only system, ports, network, and Docker data, plus collection timestamps and diagnostics. This profile skips agent usage and quota collection, including the OpenCode Go request. Tailscale peer pings, optional `agy` CLI calls, and the OpenCode quota request can generate outbound traffic.
+Agent usage and quota files stay on the machine, and the mod has no telemetry upload service. With `OPENCODE_GO_API_KEY` or a Go key from OpenCode's local store, the collector makes an HTTPS quota request to opencode.ai; the key is read locally, sent only to that host, and is not written to caches, logs, errors, notes, or output. Herdr runs the collector on ready peer machines with `--remote` and receives only system, ports, network, and Docker data, plus collection timestamps and diagnostics. This profile skips agent usage and quota collection, including the OpenCode Go request. Tailscale peer pings, optional `agy` CLI calls, and the OpenCode quota request can generate outbound traffic.
 
 ## Streaming mode
 
@@ -178,7 +192,7 @@ While Herdr Control is visible, run `herdr-app do herdr-control.toggle-demo` or 
 
 ## Estimated values
 
-Antigravity token counts and model IDs are inferred from undocumented conversation metadata. The dashboard marks affected token figures with `~`. API cost estimates use the token counts and model prices in `mods/herdr-control/prices.js`. These figures represent API list-price estimates. Actual bills and subscription charges can differ, and the dashboard leaves prices blank for unlisted models. The OpenCode row's Go figure is an estimate used when live quota windows are unavailable: OpenCode-provider usage since day 24 of the month at 0.6 × list price, bounded by the 31-day usage window and marked `≥` when it can only be a lower bound. With `OPENCODE_GO_API_KEY`, the row shows the live Go 5-hour, weekly, and monthly percentages from opencode.ai instead, and the estimate moves to the hover/narrow details as a secondary `est.` value.
+Antigravity token counts and model IDs are inferred from undocumented conversation metadata. The dashboard marks affected token figures with `~`. API cost estimates use the token counts and model prices in `mods/herdr-control/prices.js`. These figures represent API list-price estimates. Actual bills and subscription charges can differ, and the dashboard leaves prices blank for unlisted models. The OpenCode row's Go figure is an estimate used when live quota windows are unavailable: OpenCode-provider usage since day 24 of the month at 0.6 × list price, bounded by the 31-day usage window and marked `≥` when it can only be a lower bound. With a Go API key from `OPENCODE_GO_API_KEY` or OpenCode's local store, the row shows the live Go 5-hour, weekly, and monthly percentages from opencode.ai instead, and the estimate moves to the hover/narrow details as a secondary `est.` value.
 
 ## Security notes
 

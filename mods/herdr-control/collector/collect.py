@@ -47,6 +47,12 @@ OPENCODE_USAGE_INTERVAL = 60
 OPENCODE_USAGE_MAX_BYTES = 64 * 1024
 # API window name, normalized key, window minutes.
 OPENCODE_USAGE_WINDOWS = (("rolling", "five", 300), ("weekly", "week", 10080), ("monthly", "month", 43200))
+# Local OpenCode credential discovery. Values come from the user's own store and are never logged.
+OPENCODE_GO_PROVIDER = "opencode-go"
+OPENCODE_GO_KEY_LOOKUP_ENV = "HERDR_CONTROL_OPENCODE_KEY_LOOKUP"
+OPENCODE_GO_CREDENTIAL_TABLES = ("credential", "credentials")
+OPENCODE_GO_API_TYPES = ("key", "api")
+OPENCODE_GO_MAX_KEY_CHARS = 8192
 PROVIDER_SCAN_SECONDS = {"claude": 3, "codex": 1.5, "antigravity": 1.5, "opencode": 1.5, "limits.codex": 0.5}
 # 5: Claude transcript rows for DeepSeek models are reported as OpenCode Go usage.
 USAGE_CACHE_VERSION = 5
@@ -2175,16 +2181,18 @@ def collect_usage(cache_dir, errors, live_out=None, *, notes=None):
                 notes,
             )
         )
-        all_rows.extend(
-            _collect_opencode_rows(
-                home / ".local" / "share" / "opencode" / "opencode.db",
-                cache_files,
-                cutoff_ts,
-                cutoff_date,
-                errors,
-                notes,
+        opencode_db = _opencode_db_path(home)
+        if opencode_db is not None:
+            all_rows.extend(
+                _collect_opencode_rows(
+                    opencode_db,
+                    cache_files,
+                    cutoff_ts,
+                    cutoff_date,
+                    errors,
+                    notes,
+                )
             )
-        )
         all_rows.extend(
             _collect_jsonl_provider(
                 home / ".codex" / "sessions",
@@ -2529,10 +2537,249 @@ def _cached_opencode_windows(value, read_at):
     return clean
 
 
-def opencode_usage(cache_dir, now, errors):
+def _opencode_data_dirs(home):
+    """Candidate OpenCode data directories, in the order OpenCode itself prefers."""
+    candidates = []
+
+    def add(directory):
+        path = Path(directory)
+        if path not in candidates:
+            candidates.append(path)
+
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        add(Path(xdg) / "opencode")
+    if IS_WINDOWS:
+        for name in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(name)
+            if base:
+                add(Path(base) / "opencode")
+                add(Path(base) / "opencode" / "Data")
+    add(home / ".local" / "share" / "opencode")
+    if IS_MACOS:
+        add(home / "Library" / "Application Support" / "opencode")
+    return candidates
+
+
+def _opencode_db_override(home):
+    value = os.environ.get("OPENCODE_DB")
+    if not value:
+        return None
+    if value == ":memory:":
+        return False
+    path = Path(value)
+    if not path.is_absolute():
+        directories = _opencode_data_dirs(home)
+        base = directories[0] if directories else home / ".local" / "share" / "opencode"
+        path = base / path
+    return path
+
+
+def _opencode_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def _opencode_db_candidates(home):
+    override = _opencode_db_override(home)
+    if override is False:
+        return []
+    if override is not None:
+        return [override]
+
+    directories = _opencode_data_dirs(home)
+    found = []
+    for directory in directories:
+        try:
+            main = directory / "opencode.db"
+            if main.is_file() and not main.is_symlink():
+                found.append(main)
+            channels = [p for p in directory.glob("opencode-*.db") if p.is_file() and not p.is_symlink()]
+        except OSError:
+            channels = []
+        found.extend(sorted(channels, key=_opencode_mtime, reverse=True))
+    if found:
+        return found
+    return [directories[0] / "opencode.db"] if directories else []
+
+
+def _opencode_db_path(home):
+    candidates = _opencode_db_candidates(home)
+    return candidates[0] if candidates else None
+
+
+def _normalize_opencode_provider(value):
+    return re.sub(r"[^a-z0-9]+", "-", str(value).strip().lower()).strip("-")
+
+
+def _opencode_key_lookup_disabled():
+    return os.environ.get(OPENCODE_GO_KEY_LOOKUP_ENV, "").strip().lower() == "0"
+
+
+def _opencode_key_from_value(value):
+    """Return (key, stored type) from one credential value. Never returns OAuth material."""
+    if not isinstance(value, str) or len(value) > MAX_LOG_LINE_BYTES:
+        return None, "unknown"
+    try:
+        data = json.loads(value)
+    except (TypeError, ValueError):
+        return None, "unknown"
+    if not isinstance(data, dict):
+        return None, "unknown"
+    cred_type = data.get("type")
+    if not isinstance(cred_type, str):
+        return None, "unknown"
+    cred_type = cred_type.strip().lower()
+    if cred_type not in OPENCODE_GO_API_TYPES:
+        return None, cred_type or "unknown"
+    key = data.get("key")
+    if not isinstance(key, str):
+        return None, cred_type
+    key = key.strip()
+    if not key or len(key) > OPENCODE_GO_MAX_KEY_CHARS or "\r" in key or "\n" in key:
+        return None, cred_type
+    return key, cred_type
+
+
+def _read_opencode_credentials(path):
+    """Read only Go credential rows from the store. Return (rows, state)."""
+    if path is None:
+        return [], "no_db"
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2.0)
+    except (OSError, ValueError, sqlite3.Error):
+        return [], "unreadable"
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row["name"] for row in cur.fetchall()}
+        table = next((name for name in OPENCODE_GO_CREDENTIAL_TABLES if name in tables), None)
+        if table is None:
+            return [], "no_table"
+
+        cur.execute(f'PRAGMA table_info("{table}")')
+        columns = [row["name"] for row in cur.fetchall()]
+        id_cols = [
+            name for name in ("integration_id", "connector_id", "provider_id", "provider")
+            if name in columns
+        ]
+        value_col = next((name for name in ("value", "data", "secret") if name in columns), None)
+        if not id_cols or value_col is None:
+            return [], "unknown_schema"
+
+        provider_expr = "COALESCE(" + ", ".join(
+            f'NULLIF(trim("{name}"), \'\')' for name in id_cols
+        ) + ")"
+        select = [f"{provider_expr} AS provider", f'"{value_col}" AS value']
+        for optional in ("active", "time_updated", "method_id"):
+            if optional in columns:
+                select.append(f'"{optional}" AS {optional}')
+        order = []
+        if "active" in columns:
+            order.append('COALESCE("active", 0) DESC')
+        if "time_updated" in columns:
+            order.append('"time_updated" DESC')
+        sql = f'SELECT {", ".join(select)} FROM "{table}"'
+        matches = []
+        for name in id_cols:
+            matches.append(
+                f'trim(lower(replace(replace(replace(trim("{name}"), \' \', \'-\'), \'_\', \'-\'), \'/\', \'-\')), \'-\') = ?'
+            )
+        sql += f" WHERE {' OR '.join(matches)}"
+        if order:
+            sql += f" ORDER BY {', '.join(order)}"
+        cur.execute(sql, tuple(OPENCODE_GO_PROVIDER for _ in id_cols))
+        return [dict(row) for row in cur.fetchall()], "ok"
+    except (OSError, ValueError, sqlite3.Error):
+        return [], "unreadable"
+    finally:
+        conn.close()
+
+
+def _pick_opencode_go_key(rows):
+    active = [row for row in rows if row.get("active") in (1, True, "1")]
+    if active:
+        rows = active
+    first_type = "unknown"
+    for row in rows:
+        key, cred_type = _opencode_key_from_value(row.get("value"))
+        if cred_type != "unknown" and first_type == "unknown":
+            first_type = cred_type
+        if key:
+            return key, cred_type
+    return None, first_type
+
+
+def _read_opencode_legacy_key(home):
+    for directory in _opencode_data_dirs(home):
+        path = directory / "auth.json"
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+        except OSError:
+            continue
+        data = _read_json_file(path)
+        if not isinstance(data, dict):
+            return None, {"source": "auth.json", "type": "unknown"}
+        entry = None
+        for name in data:
+            if _normalize_opencode_provider(name) == OPENCODE_GO_PROVIDER:
+                entry = data[name]
+                break
+        if not isinstance(entry, dict):
+            return None, {"source": "auth.json", "type": "none"}
+        cred_type = entry.get("type")
+        if isinstance(cred_type, str) and cred_type.strip().lower() in OPENCODE_GO_API_TYPES:
+            key = entry.get("key")
+            if isinstance(key, str):
+                key = key.strip()
+                if key and len(key) <= OPENCODE_GO_MAX_KEY_CHARS and "\r" not in key and "\n" not in key:
+                    return key, {"source": "auth.json", "type": cred_type.strip().lower()}
+        return None, {
+            "source": "auth.json",
+            "type": cred_type.strip().lower() if isinstance(cred_type, str) and cred_type.strip() else "unknown",
+        }
+    return None, {"source": "none", "type": "none"}
+
+
+def opencode_go_token(home=None, notes=None):
+    """Find the Go API key without logging it. Returns (key, safe metadata)."""
+    env_token = os.environ.get("OPENCODE_GO_API_KEY")
+    if env_token and env_token.strip():
+        return env_token.strip(), {"source": "env", "type": "api"}
+    if _opencode_key_lookup_disabled():
+        return None, {"source": "disabled", "type": "none"}
+
+    base_home = Path.home() if home is None else Path(home)
+    schema_issue = None
+    for path in _opencode_db_candidates(base_home):
+        rows, state = _read_opencode_credentials(path)
+        if state in ("no_table", "unknown_schema"):
+            schema_issue = state
+        if not rows:
+            continue
+        key, cred_type = _pick_opencode_go_key(rows)
+        if key:
+            return key, {"source": "store", "type": cred_type}
+        # A Go row exists but is not an API key (for example an OAuth/Console login).
+        return None, {"source": "store", "type": cred_type}
+
+    if schema_issue and notes is not None:
+        notes.append(
+            "opencode key lookup: credential table not found"
+            if schema_issue == "no_table"
+            else "opencode key lookup: unknown credential schema"
+        )
+    return _read_opencode_legacy_key(base_home)
+
+
+def opencode_usage(cache_dir, now, errors, notes=None, home=None):
     """Read the live Go quota when the API key is present. Never stores or prints the key."""
-    token = os.environ.get("OPENCODE_GO_API_KEY")
-    if not token or not token.strip():
+    token, _source = opencode_go_token(home, notes)
+    if not token:
         return None
 
     path = cache_dir / "opencode-usage.json"
@@ -2585,13 +2832,17 @@ def opencode_usage(cache_dir, now, errors):
     return None
 
 
-def opencode_limits(home, now, cache_dir=None, errors=None):
+def opencode_limits(home, now, cache_dir=None, errors=None, notes=None):
     path = home / ".local" / "share" / "opencode" / "log" / "opencode.log"
     try:
         log_limits = _parse_opencode_limit(_newest_log_lines(path, OPENCODE_LIMIT_TAIL_BYTES), now)
     except OSError:
         log_limits = None
-    api_limits = opencode_usage(cache_dir, now, [] if errors is None else errors) if cache_dir is not None else None
+    api_limits = (
+        opencode_usage(cache_dir, now, [] if errors is None else errors, notes=notes, home=home)
+        if cache_dir is not None
+        else None
+    )
     if api_limits:
         if log_limits and isinstance(log_limits.get("reached"), dict):
             api_limits["reached"] = log_limits["reached"]
@@ -2728,7 +2979,7 @@ def collect_limits(cache_dir, errors, home=None, now=None, *, notes=None):
         "claude": _limit_record(claude.get("claude"), claude["at"]) if claude else None,
         "codex": codex_limits(home, cache_dir, now, notes),
         "antigravity": antigravity,
-        "opencode": opencode_limits(home, now, cache_dir, errors),
+        "opencode": opencode_limits(home, now, cache_dir, errors, notes),
     }
 
 
