@@ -4,3 +4,7 @@
 // Example (fill in the real machine name once the server exists):
 //   "build-server": { monthly_tb: 30, count: "total", billing_day: 1 },
 export const TRAFFIC_LIMITS = {};
+
+// OpenCode Go plan: the allowance runs from day 24 (local time) and lists at
+// 80 USD per month; Go charges the allowance at 0.6 x the API list price.
+export const OPENCODE_GO = { billingDay: 24, monthlyUsd: 80, chargeFactor: 0.6 };

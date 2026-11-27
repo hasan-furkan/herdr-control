@@ -73,5 +73,11 @@ export const PRICES = [
     "match": "fable-5",
     "input": 10,
     "output": 50
+  },
+  {
+    "match": "deepseek-v4-1-flash",
+    "input": 0.15,
+    "output": 0.6,
+    "cache_read": 0.003
   }
 ];

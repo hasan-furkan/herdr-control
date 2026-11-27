@@ -90,10 +90,10 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
     return win.countdown && win.countdown !== "—" ? `${pct} · ${win.countdown}` : pct;
   };
   const details = () => rows.map((row) => {
-    const limit = row.id === "opencode" ? row.limitNotice ?? "—"
-      : row.hint ?? (row.windows?.length
-        ? row.windows.map(formatWindow).join(" · ")
-        : `${percentLabel("5h", row.five)} · ${percentLabel("week", row.week)}`);
+    const windows = row.windows?.length ? row.windows.map(formatWindow).join(" · ") : null;
+    const limit = row.id === "opencode"
+      ? [row.limitNotice, windows, row.goSpend ? `est. ${row.goSpend.label}` : null].filter(Boolean).join(" · ") || "—"
+      : row.hint ?? (windows ?? `${percentLabel("5h", row.five)} · ${percentLabel("week", row.week)}`);
     return `${row.label} · ${limit} · today ${row.tokens}`;
   }).join("\n");
   const card = v_flex()
@@ -123,12 +123,12 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
       .child(collapsed ? "›" : "⌄"),
   );
   if (narrow) {
-    return toggleCard.tooltip(collapsed ? summary : details())
+    return toggleCard.tooltip(details())
       .when(collapsed, (el) => el.child(div().truncate().text_size(SIZES.xs).text_color(summaryColor)
         .child(dataModule.summarizeUsageCard(rows, { compact: true }))));
   }
   if (collapsed) {
-    return toggleCard.tooltip(summary).child(div().truncate().text_size(SIZES.xs).text_color(summaryColor).child(summary));
+    return toggleCard.tooltip(details()).child(div().truncate().text_size(SIZES.xs).text_color(summaryColor).child(summary));
   }
   const percent = (label, value) =>
     div().flex_none().whitespace_nowrap()
@@ -163,10 +163,23 @@ function renderSidebarUsage(rows, narrow, autoCollapsed) {
             .tooltip(row.id === "antigravity" ? "Today's tokens (estimated)" : "Today's tokens")
             .child(row.tokens)),
       )
-      .when(isOpenCode || Boolean(row.hint), (el) =>
+      .when(isOpenCode, (el) =>
+        el.when(Boolean(row.limitNotice), (line) =>
+          line.child(
+            div().font_family(monoFont()).text_color(PALETTE.danger).child(row.limitNotice),
+          ))
+          .when(Boolean(windows), (line) => line.children(windows.map(windowLine)))
+          .when(Boolean(row.goSpend) && !windows, (line) =>
+            line.child(
+              div().font_family(monoFont()).text_color(PALETTE.muted)
+                .tooltip("Estimated OpenCode Go allowance spent in this period")
+                .child(row.goSpend.label),
+            ))
+          .when(!row.limitNotice && !windows && !row.goSpend, (line) =>
+            line.child(div().font_family(monoFont()).text_color(PALETTE.muted).child("—"))))
+      .when(!isOpenCode && Boolean(row.hint), (el) =>
         el.child(
-          div().font_family(monoFont()).text_color(row.limitNotice ? PALETTE.danger : PALETTE.muted)
-            .child(row.limitNotice ?? row.hint ?? "—"),
+          div().font_family(monoFont()).text_color(PALETTE.muted).child(row.hint),
         ))
       .when(!isOpenCode && !row.hint && Boolean(windows), (el) =>
         el.children(windows.map(windowLine)))

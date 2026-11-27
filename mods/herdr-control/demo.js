@@ -137,7 +137,12 @@ function createDemoData(now) {
     claude: quota(23, 61, 75),
     codex: quota(74, 52, 150),
     antigravity: quota(89, 72, 210),
-    opencode: { reached: { window: "weekly", resets_at: time(-2 * 24 * 60) / 1000 }, source: "log" },
+    opencode: {
+      five: { ...windowLimit(55, 185), window_minutes: 300, status: "ok" },
+      week: { ...windowLimit(0, 2 * 24 * 60), window_minutes: 10080, status: "rate-limited" },
+      month: { ...windowLimit(88, 27 * 24 * 60), window_minutes: 43200, status: "ok" },
+      source: "api", read_at: time(2) / 1000,
+    },
   };
 
   const tailscale = {

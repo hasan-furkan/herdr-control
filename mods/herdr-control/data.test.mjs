@@ -121,6 +121,11 @@ const {
   buildMachinesView,
   buildMachineModels,
   buildUsageRows,
+  estimateOpenCodeGoSpend,
+  estimateRowUsd,
+  findPriceRule,
+  localIsoDate,
+  opencodeGoPeriodStart,
   countLabel,
   formatTokens,
   formatStaleAge,
@@ -178,13 +183,22 @@ test("demo fixtures survive collector validation and exercise the dashboard view
   assert.equal(rows.length, 4);
   assert.equal(rows.find((row) => row.id === "claude").five, 23);
   assert.deepEqual(rows.filter((row) => row.limitNotice).map((row) => row.id), ["opencode"]);
+  const demoGo = rows.find((row) => row.id === "opencode").goSpend;
+  assert.ok(demoGo.usd > 0);
+  assert.match(demoGo.label, /^~?\$\d+\.\d{2} \/ \$80 this period \(est\.\)$/);
   const quota = demo.localEntry.result.limits;
   const nowSeconds = now.getTime() / 1000;
   for (const id of ["claude", "codex", "antigravity"]) {
     assert.ok(quota[id].five.resets_at > nowSeconds);
     assert.ok(quota[id].week.resets_at > nowSeconds);
   }
-  assert.ok(quota.opencode.reached.resets_at > nowSeconds);
+  assert.equal(quota.opencode.five.status, "ok");
+  assert.equal(quota.opencode.week.status, "rate-limited");
+  assert.equal(quota.opencode.week.remaining, 0);
+  assert.equal(quota.opencode.month.window_minutes, 43200);
+  assert.ok([quota.opencode.five, quota.opencode.week, quota.opencode.month]
+    .every((window) => window.resets_at > nowSeconds));
+  assert.equal(rows.find((row) => row.id === "opencode").limitNotice, "week limit reached · resets in 2d");
   const { models } = buildMachineModels({ ...demo, limitsMap: demo.limits, now });
   const build = models.find((machine) => machine.key === "build-server");
   assert.deepEqual(build.remote.containers.map(({ name }) => name).sort(), ["api", "postgres", "web", "worker"]);
@@ -200,7 +214,7 @@ test("demo timestamps roll forward with the wall clock", () => {
     const result = getDemoData(now).localEntry.result;
     assert.equal(result.usage.days[0].date, date);
     assert.equal(Date.parse(result.generated_at), now.getTime() - 60_000);
-    assert.equal(result.limits.opencode.reached.resets_at * 1000 - now.getTime(), 2 * 86_400_000);
+    assert.equal(result.limits.opencode.week.resets_at * 1000 - now.getTime(), 2 * 86_400_000);
   }
 });
 
@@ -316,6 +330,14 @@ test("the demo sidebar reserves space for its bottom cards before fitting termin
       assert.equal(Boolean(renderedElement(view, "nav").layout.scrollY), scroll);
       assert.equal(Boolean(renderedElement(view, "sidebar-usage-claude")), collapsed === false);
       assert.ok(renderedElement(view, "sidebar-usage"));
+      if (collapsed === false) {
+        const opencodeUsage = renderedText(renderedElement(view, "sidebar-usage-opencode"));
+        assert.match(opencodeUsage, /week limit reached · resets in 2d/);
+        assert.match(opencodeUsage, /5h 55%/);
+        assert.match(opencodeUsage, /week 0%/);
+        assert.match(opencodeUsage, /month 88%/);
+        assert.doesNotMatch(opencodeUsage, /\$80 this period/);
+      }
       assert.ok(renderedElement(view, "stream-switch-row"));
       assert.equal(Boolean(renderedElement(view, "tailnet-card")), height >= 700);
       const back = renderedElement(view, "return-terminal");
@@ -708,7 +730,15 @@ test("usage rows combine today's machine tokens with the newest provider limits"
       countdown: "—", tokens: "—",
     },
     { id: "antigravity", label: "Antigravity", five: null, week: null, countdown: "—", tokens: "~10K tok" },
-    { id: "opencode", label: "OpenCode", five: null, week: null, countdown: "—", tokens: "100 tok" },
+    {
+      id: "opencode", label: "OpenCode", five: 57, week: null,
+      windows: [{ key: "five", label: "5h", remaining: 57, resets_at: undefined, countdown: "—" }],
+      countdown: "—", tokens: "100 tok",
+      goSpend: {
+        usd: 0, capUsd: 80, periodStart: "2026-10-24", partial: true,
+        label: "≥~$0.00 / $80 this period (est.)",
+      },
+    },
   ]);
   assert.equal(summarizeUsageTokens(entries, date).total, 1_210_099);
   assert.equal(summarizeUsageTokens(entries, date).estimated, true);
@@ -939,6 +969,169 @@ test("the OpenCode log signal appears without tokens, takes priority, and expire
   assert.equal(summarizeUsageCard(rows), "OpenCode · monthly limit reached · resets Nov 24");
   assert.equal(summarizeUsageCard(rows, { compact: true }), "Limit reached");
   assert.deepEqual(buildUsageRows([{ result }], reset).map((row) => row.id), ["codex"]);
+});
+
+test("OpenCode API windows use remaining percentages, 5h/week/month labels and reset countdowns", () => {
+  const now = new Date("2026-11-27T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+  const raw = {
+    limits: {
+      opencode: {
+        five: { remaining: 99, resets_at: nowS + 3 * 3600, window_minutes: 300, status: "ok" },
+        week: { remaining: 87, resets_at: nowS + 3 * 86400, window_minutes: 10080, status: "ok" },
+        month: { remaining: 94, resets_at: nowS + 27 * 86400, window_minutes: 43200, status: "ok" },
+        source: "api", read_at: nowS,
+      },
+    },
+    usage: { days: [{
+      date: "2026-11-27", provider: "opencode", model: "deepseek-v4.1-flash", input: 1_000_000,
+    }] },
+  };
+  const clean = validateCollectorResult(raw);
+  assert.deepEqual(clean.limits.opencode, raw.limits.opencode);
+  const row = buildUsageRows([{ result: clean }], now).find((item) => item.id === "opencode");
+  assert.equal(row.five, 99);
+  assert.equal(row.week, 87);
+  assert.equal(row.countdown, "3h");
+  assert.equal(row.limitNotice, undefined);
+  assert.deepEqual(
+    row.windows.map(({ label, remaining, countdown, status }) => [label, remaining, countdown, status]),
+    [["5h", 99, "3h", "ok"], ["week", 87, "3d", "ok"], ["month", 94, "27d", "ok"]],
+  );
+  assert.ok(row.goSpend);
+});
+
+test("a rate-limited OpenCode window takes priority over a log signal and other rows", () => {
+  const now = new Date("2026-11-27T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+  const result = validateCollectorResult({
+    limits: {
+      claude: { five: { remaining: 80, resets_at: nowS + 3600 }, read_at: nowS },
+      opencode: {
+        five: { remaining: 0, resets_at: nowS + 2 * 3600, window_minutes: 300, status: "rate-limited" },
+        week: { remaining: 40, resets_at: nowS + 2 * 86400, window_minutes: 10080, status: "ok" },
+        month: { remaining: 90, resets_at: nowS + 20 * 86400, window_minutes: 43200, status: "ok" },
+        reached: { window: "monthly", resets_at: nowS + 5 * 86400 },
+        source: "api", read_at: nowS,
+      },
+    },
+  });
+  const rows = buildUsageRows([{ result }], now);
+  const opencode = rows.find((row) => row.id === "opencode");
+  assert.equal(opencode.limitNotice, "5h limit reached · resets in 2h");
+  assert.equal(opencode.five, 0);
+  assert.equal(summarizeUsageCard(rows), "OpenCode · 5h limit reached · resets in 2h");
+  assert.equal(summarizeUsageCard(rows, { compact: true }), "Limit reached");
+
+  // Bad types and unknown statuses are dropped, not rendered.
+  assert.equal(validateCollectorResult({ ports: [], limits: { opencode: {
+    five: { remaining: "0", resets_at: nowS, window_minutes: 300, status: "rate-limited" },
+  } } }).limits, undefined);
+  assert.equal(validateCollectorResult({ ports: [], limits: { opencode: {
+    five: { remaining: 0, resets_at: nowS, window_minutes: 300, status: "limited" },
+  } } }).limits.opencode.five.status, undefined);
+});
+
+test("an OpenCode row without live windows falls back to the spend estimate", () => {
+  const now = new Date("2026-11-27T12:00:00Z");
+  const result = validateCollectorResult({
+    installed: { opencode: true },
+    usage: { days: [{
+      date: "2026-11-27", provider: "opencode", model: "deepseek-v4.1-flash", input: 1_000_000,
+    }] },
+  });
+  const row = buildUsageRows([{ result }], now).find((item) => item.id === "opencode");
+  assert.equal(row.windows, undefined);
+  assert.equal(row.five, null);
+  assert.equal(row.week, null);
+  assert.equal(row.limitNotice, undefined);
+  assert.equal(row.goSpend.label, "~$0.09 / $80 this period (est.)");
+  assert.equal(summarizeUsageCard([row]), "OpenCode · 1M tok");
+});
+
+test("the Usage card renders live OpenCode windows and keeps the estimate in details", () => {
+  const now = new Date("2026-11-27T12:00:00Z");
+  const nowS = now.getTime() / 1000;
+  const result = validateCollectorResult({
+    version: 1,
+    generated_at: now.toISOString(),
+    installed: { claude: false, opencode: true, codex: false, agy: false, pi: false, gemini: false },
+    limits: { opencode: {
+      five: { remaining: 99, resets_at: nowS + 3600, window_minutes: 300, status: "ok" },
+      week: { remaining: 87, resets_at: nowS + 2 * 86400, window_minutes: 10080, status: "ok" },
+      month: { remaining: 94, resets_at: nowS + 20 * 86400, window_minutes: 43200, status: "ok" },
+      source: "api", read_at: nowS,
+    } },
+    usage: { days: [{
+      date: "2026-11-27", provider: "opencode", model: "deepseek-v4.1-flash", input: 1_000_000,
+    }] },
+  });
+  state.set("test.layout", controlLayout);
+  state.set(COLLECT_KEY, { schema: 1, machines: { local: { result, at: now.getTime(), error: null } } });
+  state.set("herdr-control.usageCollapsed", false);
+  setDemo(false);
+  const cx = { spawn() {}, notify() {}, timer: { every() {} } };
+  try {
+    const nav = new HerdrControl();
+    nav.init({ part: "nav" }, cx);
+    let view = nav.render(cx);
+    view.actions.on_size_change({ width: 1200, height: 1000 }, cx);
+    view = nav.render(cx);
+    const text = renderedText(renderedElement(view, "sidebar-usage-opencode"));
+    assert.match(text, /5h 99%/);
+    assert.match(text, /week 87%/);
+    assert.match(text, /month 94%/);
+    assert.doesNotMatch(text, /\$80 this period/);
+  } finally {
+    state.clear();
+    setDemo(false);
+  }
+});
+
+test("the OpenCode Go period starts on the previous day-24 boundary in local time", () => {
+  assert.equal(localIsoDate(opencodeGoPeriodStart(new Date(2026, 10, 23, 12), 24)), "2026-10-24");
+  assert.equal(localIsoDate(opencodeGoPeriodStart(new Date(2026, 10, 24, 0, 1), 24)), "2026-11-24");
+  assert.equal(localIsoDate(opencodeGoPeriodStart(new Date(2027, 0, 5, 12), 24)), "2026-12-24");
+});
+
+test("the Go spend estimate prices OpenCode rows in the period at 0.6 x list price", () => {
+  const now = new Date(2026, 10, 26, 12);
+  const today = localIsoDate(now);
+  const beforePeriod = localIsoDate(new Date(2026, 10, 23));
+  const entries = [{ result: { usage: { days: [
+    { date: today, provider: "opencode", model: "deepseek-v4.1-flash", input: 1_000_000, output: 1_000_000, cache_read: 1_000_000 },
+    { date: beforePeriod, provider: "opencode", model: "deepseek-v4.1-flash", input: 100_000_000 },
+    { date: today, provider: "claude", model: "claude-sonnet-4-6", input: 100_000_000 },
+  ] } } }];
+  assert.equal(findPriceRule("deepseek-v4.1-flash").input, 0.15);
+  assert.equal(estimateRowUsd({ model: "mystery-model", input: 1_000_000 }), null);
+  const spend = estimateOpenCodeGoSpend(entries, now);
+  assert.equal(spend.periodStart, "2026-11-24");
+  assert.equal(spend.partial, false);
+  assert.equal(spend.capUsd, 80);
+  assert.ok(Math.abs(spend.usd - 0.4518) < 1e-9);
+  assert.equal(spend.label, "~$0.45 / $80 this period (est.)");
+  const row = buildUsageRows(entries, now).find((item) => item.id === "opencode");
+  assert.equal(row.goSpend.label, spend.label);
+});
+
+test("the Go spend estimate is marked partial when the period predates the usage window or a price is missing", () => {
+  const now = new Date(2026, 10, 26, 12);
+  const today = localIsoDate(now);
+  const priced = { result: { usage: { days: [
+    { date: today, provider: "opencode", model: "deepseek-v4.1-flash", input: 1_000_000, output: 1_000_000, cache_read: 1_000_000 },
+  ] } } };
+  const shallow = estimateOpenCodeGoSpend([priced], now, { windowDays: 1 });
+  assert.equal(shallow.partial, true);
+  assert.equal(shallow.label, "≥~$0.45 / $80 this period (est.)");
+
+  const unlisted = estimateOpenCodeGoSpend([{ result: { usage: { days: [
+    { date: today, provider: "opencode", model: "unlisted-model", input: 1000 },
+  ] } } }], now);
+  assert.equal(unlisted.partial, true);
+  assert.equal(unlisted.label, "≥~$0.00 / $80 this period (est.)");
+
+  assert.equal(estimateOpenCodeGoSpend([{ result: {} }], now), null);
 });
 
 test("Funnel ports annotate structured Serve routes and work without a matching route", () => {

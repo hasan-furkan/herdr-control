@@ -1,6 +1,8 @@
 // Pure view-model transformations over live Herdr and collector data. No I/O.
 
 import { statusWord, statusColor as paletteStatusColor } from "./palette.js";
+import { PRICES } from "./prices.js";
+import { OPENCODE_GO } from "./limits.js";
 
 const MAX_COLLECTOR_STRING = 500;
 const MAX_COLLECTOR_ROWS = 2000;
@@ -65,12 +67,27 @@ const providerLimit = (value) => {
   return Object.keys(clean).some((key) => key !== "read_at") ? clean : undefined;
 };
 const opencodeWindow = oneOf("5-hour", "weekly", "monthly");
-const opencodeLimit = objectOf({
-  reached: objectOf({
-    window: opencodeWindow, resets_at: (value) => boundedNumber(value, 8.64e12),
-  }, ["window", "resets_at"]),
-  source: oneOf("log"),
-}, ["reached", "source"]);
+const opencodeWindowStatus = oneOf("ok", "rate-limited");
+const opencodeLimit = (value) => {
+  if (!record(value)) return undefined;
+  const clean = {};
+  for (const key of ["five", "week", "month"]) {
+    const window = objectOf({
+      remaining: percent, resets_at: counter, window_minutes: counter, status: opencodeWindowStatus,
+    }, ["remaining"])(value[key]);
+    if (window) clean[key] = window;
+  }
+  const reached = objectOf({
+    window: opencodeWindow, resets_at: (item) => boundedNumber(item, 8.64e12),
+  }, ["window", "resets_at"])(value.reached);
+  if (reached) clean.reached = reached;
+  const source = oneOf("log", "api")(value.source);
+  if (source) clean.source = source;
+  const readAt = counter(value.read_at);
+  if (readAt !== undefined) clean.read_at = readAt;
+  const hasWindow = ["five", "week", "month"].some((key) => Object.hasOwn(clean, key));
+  return hasWindow || Object.hasOwn(clean, "reached") ? clean : undefined;
+};
 const dockerProbeFields = {
   docker_ps: probeText, docker_ps_rc: integer, docker_stats: probeText, docker_stats_rc: integer,
 };
@@ -275,6 +292,92 @@ export function formatStaleAge(readAtS, nowS) {
   return `${days}d ago`;
 }
 
+/** First matching price rule for a model id (lowercased, dots replaced by dashes). */
+export function findPriceRule(model, prices = PRICES) {
+  if (!model || typeof model !== "string" || !Array.isArray(prices)) return null;
+  const norm = model.toLowerCase().replace(/\./g, "-");
+  for (const rule of prices) {
+    if (rule && rule.match && norm.includes(rule.match)) return rule;
+  }
+  return null;
+}
+
+/** API list-price estimate for one usage row in USD; null when the model is unlisted. */
+export function estimateRowUsd(row, prices = PRICES) {
+  const rule = findPriceRule(row?.model, prices);
+  if (!rule) return null;
+  const input = Number(row?.input) || 0;
+  const output = Number(row?.output) || 0;
+  const cacheRead = Number(row?.cache_read) || 0;
+  const cacheWrite = Number(row?.cache_write) || 0;
+  const cacheReadPrice = typeof rule.cache_read === "number" ? rule.cache_read : 0.1 * rule.input;
+  const cacheWritePrice = rule.input * 1.25;
+  return (
+    (input * rule.input +
+      output * rule.output +
+      cacheRead * cacheReadPrice +
+      cacheWrite * cacheWritePrice) /
+    1_000_000
+  );
+}
+
+/** Local date the OpenCode Go billing period starts (day 24 by default). */
+export function opencodeGoPeriodStart(now = new Date(), billingDay = OPENCODE_GO.billingDay) {
+  const day = Math.max(1, Math.min(31, Math.floor(Number(billingDay) || 1)));
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const thisMonthDay = Math.min(day, new Date(y, m + 1, 0).getDate());
+  if (now.getDate() >= thisMonthDay) return new Date(y, m, thisMonthDay);
+  const prevMonthDay = Math.min(day, new Date(y, m, 0).getDate());
+  return new Date(y, m - 1, prevMonthDay);
+}
+
+// The collector reports at most this many local days, including today
+// (RETENTION_DAYS in collector/collect.py).
+export const USAGE_WINDOW_DAYS = 31;
+
+/**
+ * Estimated OpenCode Go allowance spent in the current period. Sums the
+ * OpenCode-provider list prices since the billing-day boundary and applies the
+ * plan's charge factor. `partial` marks a lower bound: the collector window
+ * does not reach the period start, or a priced row was missing.
+ */
+export function estimateOpenCodeGoSpend(entries, now = new Date(), {
+  prices = PRICES,
+  config = OPENCODE_GO,
+  windowDays = USAGE_WINDOW_DAYS,
+} = {}) {
+  const periodStart = localIsoDate(opencodeGoPeriodStart(now, config.billingDay));
+  const today = localIsoDate(now);
+  const windowStart = localIsoDate(new Date(
+    now.getFullYear(), now.getMonth(), now.getDate() - (Math.max(1, windowDays) - 1),
+  ));
+  let listUsd = 0;
+  let priced = true;
+  let hasData = false;
+  for (const entry of entries) {
+    const days = entry?.result?.usage?.days;
+    if (!Array.isArray(days)) continue;
+    hasData = true;
+    for (const row of days) {
+      if (!row?.date || row.provider !== "opencode" || row.date < periodStart || row.date > today) continue;
+      const usd = estimateRowUsd(row, prices);
+      if (usd === null) { priced = false; continue; }
+      listUsd += usd;
+    }
+  }
+  if (!hasData) return null;
+  const usd = listUsd * config.chargeFactor;
+  const partial = periodStart < windowStart || !priced;
+  return {
+    usd,
+    capUsd: config.monthlyUsd,
+    periodStart,
+    partial,
+    label: `${partial ? "≥~" : "~"}$${usd.toFixed(2)} / $${config.monthlyUsd} this period (est.)`,
+  };
+}
+
 export function buildUsageRows(entries, now = new Date()) {
   const { providers } = summarizeUsageTokens(entries, localIsoDate(now));
   const nowS = now.getTime() / 1000;
@@ -286,15 +389,19 @@ export function buildUsageRows(entries, now = new Date()) {
     let hint = null;
     let limits = null;
     let limitNotice = null;
+    let logReached = null;
     if (id === "opencode") {
-      let reached = null;
       for (const entry of entries) {
-        const candidate = opencodeLimit(entry?.result?.limits?.opencode)?.reached;
-        if (candidate && candidate.resets_at > (reached?.resets_at ?? nowS)) reached = candidate;
+        const candidate = opencodeLimit(entry?.result?.limits?.opencode);
+        if (!candidate) continue;
+        const reached = candidate.reached;
+        if (reached && reached.resets_at > (logReached?.resets_at ?? nowS)) logReached = reached;
+        const hasWindows = ["five", "week", "month"].some((key) => Number.isFinite(candidate[key]?.remaining));
+        if (hasWindows && (!limits || (candidate.read_at ?? 0) > (limits.read_at ?? 0))) limits = candidate;
       }
-      if (reached) {
-        const resetDate = new Date(reached.resets_at * 1000);
-        limitNotice = `${reached.window} limit reached · resets ${MONTHS_SHORT[resetDate.getMonth()]} ${resetDate.getDate()}`;
+      if (logReached) {
+        const resetDate = new Date(logReached.resets_at * 1000);
+        limitNotice = `${logReached.window} limit reached · resets ${MONTHS_SHORT[resetDate.getMonth()]} ${resetDate.getDate()}`;
       }
     } else {
       for (const entry of entries) {
@@ -313,19 +420,30 @@ export function buildUsageRows(entries, now = new Date()) {
       .filter(([key, value]) => key !== "read_at" && Number.isFinite(value?.remaining))
       .map(([key, value]) => ({
         key,
-        label: codexWindowLabel(value.window_minutes, key),
+        label: id === "opencode" && key === "month" ? "month" : codexWindowLabel(value.window_minutes, key),
         remaining: value.remaining,
         resets_at: value.resets_at,
         countdown: formatResetCountdown(value.resets_at, nowS),
+        ...(value.status ? { status: value.status } : {}),
       }))
       .sort((a, b) => {
         const priority = (label) => label === "5h" ? 0 : label === "week" ? 1 : 2;
         return priority(a.label) - priority(b.label);
       });
+    if (id === "opencode") {
+      const limited = windows.find((window) => window.status === "rate-limited");
+      if (limited) {
+        limitNotice = `${limited.label} limit reached${limited.countdown !== "—" ? ` · resets in ${limited.countdown}` : ""}`;
+      } else if (logReached) {
+        const resetDate = new Date(logReached.resets_at * 1000);
+        limitNotice = `${logReached.window} limit reached · resets ${MONTHS_SHORT[resetDate.getMonth()]} ${resetDate.getDate()}`;
+      }
+    }
     const fiveWindow = windows.find((window) => window.label === "5h");
     const weekWindow = windows.find((window) => window.label === "week");
     const countdown = fiveWindow?.countdown ?? "—";
     const staleAge = formatStaleAge(limits?.read_at, nowS);
+    const goSpend = id === "opencode" ? estimateOpenCodeGoSpend(entries, now) : null;
     return [{
       id,
       label,
@@ -334,6 +452,7 @@ export function buildUsageRows(entries, now = new Date()) {
       ...(windows.length ? { windows } : {}),
       countdown,
       tokens: formatTokens(tokens?.tokens, { estimated: tokens?.estimated }),
+      ...(goSpend ? { goSpend } : {}),
       ...(staleAge ? { staleAge } : {}),
       ...(hint ? { hint } : {}),
       ...(limitNotice ? { limitNotice } : {}),

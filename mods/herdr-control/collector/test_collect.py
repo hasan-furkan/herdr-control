@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from types import ModuleType
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 import collect
 
@@ -52,6 +53,10 @@ class CollectorTests(unittest.TestCase):
         self.home = Path(temp.name)
         self.cache = self.home / "cache"
         self.now = 1795197207
+        # Keep tests deterministic even when the developer machine exports the key.
+        saved_key = os.environ.pop("OPENCODE_GO_API_KEY", None)
+        if saved_key is not None:
+            self.addCleanup(os.environ.__setitem__, "OPENCODE_GO_API_KEY", saved_key)
 
     def test_ssh_config_hosts_collect_only_literal_aliases(self):
         config = self.home / ".ssh" / "config"
@@ -209,6 +214,54 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(notes, [])
         self.assertEqual(len(cache), 1)
+
+    def test_deepseek_claude_transcripts_are_reported_as_opencode(self):
+        path = self.home / ".claude" / "projects" / "go" / "session.jsonl"
+        path.parent.mkdir(parents=True)
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        def line(model, tokens, event_id):
+            return json.dumps({
+                "type": "assistant", "timestamp": timestamp, "requestId": event_id,
+                "message": {
+                    "id": event_id, "model": model,
+                    "usage": {"input_tokens": tokens, "output_tokens": tokens},
+                },
+            }).encode() + b"\n"
+
+        path.write_bytes(line("deepseek-v4.1-flash", 7, "go") + line("claude-sonnet-4-6", 5, "cc"))
+
+        # A cache written under the previous provider mapping must be ignored.
+        st = path.stat()
+        stale_key = collect._cache_key("claude", path)
+        self.assertTrue(collect._write_json_atomic(self.cache / "usage-cache.json", {
+            "version": collect.USAGE_CACHE_VERSION - 1,
+            "files": {stale_key: {"stamp": [st.st_size, st.st_mtime_ns], "rows": [
+                {
+                    "date": collect._parse_iso_to_epoch(timestamp)[1], "provider": "claude",
+                    "model": "deepseek-v4.1-flash", "input": 7,
+                },
+            ]}},
+        }))
+
+        errors = []
+        with patch.object(collect.Path, "home", return_value=self.home):
+            days = collect.collect_usage(self.cache, errors)["days"]
+        self.assertEqual(errors, [])
+        by_provider = {row["provider"]: row for row in days}
+        self.assertEqual(set(by_provider), {"claude", "opencode"})
+        self.assertEqual(by_provider["opencode"]["model"], "deepseek-v4.1-flash")
+        self.assertEqual(by_provider["opencode"]["input"], 7)
+        self.assertEqual(by_provider["claude"]["model"], "claude-sonnet-4-6")
+        self.assertEqual(by_provider["claude"]["input"], 5)
+        self.assertFalse(any(
+            row["provider"] == "claude" and row["model"].lower().startswith("deepseek")
+            for row in days
+        ))
+        self.assertEqual(
+            collect._read_cache(self.cache / "usage-cache.json")["version"],
+            collect.USAGE_CACHE_VERSION,
+        )
 
     def test_usage_rebuilds_a_p6_cache_even_when_the_source_file_is_unchanged(self):
         path = self.home / ".claude" / "projects" / "old-cache.jsonl"
@@ -555,6 +608,152 @@ class CollectorTests(unittest.TestCase):
             "reached": {"window": "5-hour", "resets_at": epoch + 5400}, "source": "log",
         })
         self.assertIsNone(collect._parse_opencode_limit(collect._newest_log_lines(path, 40), epoch))
+
+    def opencode_body(self, rolling=1, weekly=13, monthly=6, statuses=("ok", "ok", "ok")):
+        return {
+            "usage": {
+                "rolling": {"status": statuses[0], "percent": rolling, "resetsAt": "2026-11-27T23:40:26.000Z"},
+                "weekly": {"status": statuses[1], "percent": weekly, "resetsAt": "2026-11-30T00:00:00.000Z"},
+                "monthly": {"status": statuses[2], "percent": monthly, "resetsAt": "2026-12-24T17:21:38.000Z"},
+            }
+        }
+
+    def test_opencode_usage_parses_windows_and_rate_limited_status(self):
+        rolling, _ = collect._parse_iso_to_epoch("2026-11-27T23:40:26.000Z")
+        weekly, _ = collect._parse_iso_to_epoch("2026-11-30T00:00:00.000Z")
+        monthly, _ = collect._parse_iso_to_epoch("2026-12-24T17:21:38.000Z")
+        self.assertEqual(
+            collect._opencode_usage_windows(self.opencode_body(statuses=("rate-limited", "ok", "ok"))),
+            {
+                "five": {"remaining": 99.0, "resets_at": rolling, "window_minutes": 300, "status": "rate-limited"},
+                "week": {"remaining": 87.0, "resets_at": weekly, "window_minutes": 10080, "status": "ok"},
+                "month": {"remaining": 94.0, "resets_at": monthly, "window_minutes": 43200, "status": "ok"},
+            },
+        )
+
+    def test_opencode_usage_rejects_bad_types_and_ranges(self):
+        cases = []
+        for window, field, value in [
+            ("rolling", "percent", "1"),
+            ("rolling", "percent", 101),
+            ("rolling", "percent", -1),
+            ("rolling", "percent", True),
+            ("rolling", "status", "limited"),
+            ("rolling", "resetsAt", 123),
+            ("rolling", "resetsAt", "not-a-date"),
+        ]:
+            body = self.opencode_body()
+            body["usage"][window][field] = value
+            cases.append(body)
+        missing = self.opencode_body()
+        del missing["usage"]["weekly"]
+        cases.extend([missing, {"usage": []}, {}, []])
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertIsNone(collect._opencode_usage_windows(body))
+
+    def test_opencode_usage_request_uses_the_fixed_host_and_a_normal_user_agent(self):
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return b"{}"
+
+        def fake_open(request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+            return Response()
+
+        with patch.object(collect, "_opencode_open", side_effect=fake_open):
+            self.assertEqual(collect._opencode_fetch_body("sk-test-key"), b"{}")
+        self.assertEqual(captured["url"], collect.OPENCODE_USAGE_URL)
+        self.assertEqual(captured["timeout"], collect.OPENCODE_USAGE_TIMEOUT)
+        self.assertEqual(captured["headers"]["authorization"], "Bearer sk-test-key")
+        self.assertEqual(captured["headers"]["user-agent"], "herdr-control/1.0")
+
+    def test_opencode_usage_without_key_makes_no_request(self):
+        errors = []
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", side_effect=AssertionError("request")), \
+                patch.object(collect.urllib.request, "urlopen", side_effect=AssertionError("urllib")):
+            self.assertIsNone(collect.opencode_usage(self.cache, self.now, errors))
+        self.assertEqual(errors, [])
+        self.assertFalse((self.cache / "opencode-usage.json").exists())
+
+    def test_opencode_usage_caches_for_60_seconds_without_the_key(self):
+        key = "sk-fake-SECRET-TOKEN-123"
+        errors = []
+        first_body = json.dumps(self.opencode_body()).encode()
+        second_body = json.dumps(self.opencode_body(rolling=5)).encode()
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": key}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", return_value=first_body) as fetch:
+            first = collect.opencode_usage(self.cache, self.now, errors)
+            second = collect.opencode_usage(self.cache, self.now + 59, errors)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(first, second)
+        self.assertEqual(first["read_at"], self.now)
+        self.assertEqual(errors, [])
+        self.assertNotIn(key, (self.cache / "opencode-usage.json").read_text(encoding="utf-8"))
+
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": key}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", return_value=second_body) as fetch:
+            third = collect.opencode_usage(self.cache, self.now + 60, errors)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(third["five"]["remaining"], 95.0)
+        self.assertEqual(third["read_at"], self.now + 60)
+        self.assertEqual(errors, [])
+
+    def test_opencode_usage_errors_never_include_the_key(self):
+        key = "sk-fake-SECRET-TOKEN-456"
+        errors = []
+        failure = urllib.error.HTTPError(collect.OPENCODE_USAGE_URL, 401, "Unauthorized", {}, None)
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": key}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", side_effect=failure):
+            self.assertIsNone(collect.opencode_limits(self.home, self.now, self.cache, errors))
+        self.assertEqual(errors, ["opencode usage: HTTP 401"])
+        serialized = json.dumps({
+            "errors": errors,
+            "cache": (self.cache / "opencode-usage.json").read_text(encoding="utf-8"),
+        })
+        self.assertNotIn(key, serialized)
+
+    def test_opencode_usage_timeout_and_bad_body_are_short_errors(self):
+        errors = []
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "fake-key"}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", side_effect=TimeoutError):
+            self.assertIsNone(collect.opencode_usage(self.cache, self.now, errors))
+        self.assertEqual(errors, ["opencode usage: timeout"])
+
+        errors = []
+        body = json.dumps(self.opencode_body(rolling=101)).encode()
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "fake-key"}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", return_value=body):
+            self.assertIsNone(collect.opencode_usage(self.cache, self.now + 120, errors))
+        self.assertEqual(errors, ["opencode usage: invalid response"])
+
+    def test_opencode_api_windows_keep_an_active_log_signal(self):
+        root = self.home / ".local" / "share" / "opencode" / "log"
+        root.mkdir(parents=True)
+        (root / "opencode.log").write_text(
+            "2026-11-20T12:00:00Z level=ERROR QuotaExceeded: "
+            "OpenCode Go usage limit reached (monthly, resets in 6d).\n",
+            encoding="utf-8",
+        )
+        epoch, _ = collect._parse_iso_to_epoch("2026-11-20T12:00:00Z")
+        body = json.dumps(self.opencode_body()).encode()
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "fake-key"}, clear=True), \
+                patch.object(collect, "_opencode_fetch_body", return_value=body):
+            result = collect.opencode_limits(self.home, epoch, self.cache, [])
+        self.assertEqual(result["source"], "api")
+        self.assertEqual(result["five"]["remaining"], 99.0)
+        self.assertEqual(result["reached"], {"window": "monthly", "resets_at": epoch + 6 * 86400})
 
     def test_limits_file_staleness_and_windows_default(self):
         limits = {"five": {"remaining": 87.0, "resets_at": None}, "week": None}

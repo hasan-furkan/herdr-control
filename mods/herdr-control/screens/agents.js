@@ -149,35 +149,10 @@ function extractModelFromTitle(title) {
   return "—";
 }
 
-function buildHelpers(prices) {
+function buildHelpers(prices, data) {
   const priceList = Array.isArray(prices) ? prices : [];
 
-  const findPriceRule = (model) => {
-    if (!model || typeof model !== "string") return null;
-    const norm = model.toLowerCase().replace(/\./g, "-");
-    for (const rule of priceList) {
-      if (rule && rule.match && norm.includes(rule.match)) return rule;
-    }
-    return null;
-  };
-
-  const estimateRowUsd = (row) => {
-    const rule = findPriceRule(row?.model);
-    if (!rule) return null;
-    const input = Number(row?.input) || 0;
-    const output = Number(row?.output) || 0;
-    const cacheRead = Number(row?.cache_read) || 0;
-    const cacheWrite = Number(row?.cache_write) || 0;
-    const cacheReadPrice = typeof rule.cache_read === "number" ? rule.cache_read : 0.1 * rule.input;
-    const cacheWritePrice = rule.input * 1.25;
-    return (
-      (input * rule.input +
-        output * rule.output +
-        cacheRead * cacheReadPrice +
-        cacheWrite * cacheWritePrice) /
-      1_000_000
-    );
-  };
+  const estimateRowUsd = (row) => data.estimateRowUsd(row, priceList);
 
   return {
     PROVIDER_DEFS,
@@ -308,7 +283,7 @@ export function renderAgents({
   embeddedPanel,
 }) {
   const activeTab = AGENTS_TABS.includes(agentsTab) ? agentsTab : "now";
-  const helpers = buildHelpers(prices);
+  const helpers = buildHelpers(prices, data);
 
   let body;
   if (activeTab === "usage") {

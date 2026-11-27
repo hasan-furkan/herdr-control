@@ -25,6 +25,8 @@ import sys
 import tempfile
 from threading import Event, Lock, Thread
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 
 
@@ -39,8 +41,15 @@ MAX_LOG_LINE_BYTES = 8 * 1024 * 1024
 CPU_SAMPLE_SECONDS = 0.25
 CODEX_LIMIT_TAIL_BYTES = 32 * 1024 * 1024
 OPENCODE_LIMIT_TAIL_BYTES = 2 * 1024 * 1024
+OPENCODE_USAGE_URL = "https://opencode.ai/inference/go/v1/usage"
+OPENCODE_USAGE_TIMEOUT = 5
+OPENCODE_USAGE_INTERVAL = 60
+OPENCODE_USAGE_MAX_BYTES = 64 * 1024
+# API window name, normalized key, window minutes.
+OPENCODE_USAGE_WINDOWS = (("rolling", "five", 300), ("weekly", "week", 10080), ("monthly", "month", 43200))
 PROVIDER_SCAN_SECONDS = {"claude": 3, "codex": 1.5, "antigravity": 1.5, "opencode": 1.5, "limits.codex": 0.5}
-USAGE_CACHE_VERSION = 4
+# 5: Claude transcript rows for DeepSeek models are reported as OpenCode Go usage.
+USAGE_CACHE_VERSION = 5
 MAX_ERROR_CHARS = 200
 MAX_PROBE_BYTES = 256 * 1024
 DOCKER_PS_FIELDS = ("ID", "Names", "Name", "Image", "State", "Status", "Ports")
@@ -1319,9 +1328,13 @@ def _parse_claude_file(path_str, cutoff_date, budget):
         bkey = (date_str, model, project)
         rec = buckets.get(bkey)
         if rec is None:
+            # Older OpenCode Go workers ran through the Claude Code CLI. Their
+            # transcripts are stored like Claude sessions, so classify DeepSeek
+            # models as OpenCode instead of inflating Claude totals.
+            provider_name = "opencode" if model.strip().lower().startswith("deepseek") else "claude"
             rec = {
                 "date": date_str,
-                "provider": "claude",
+                "provider": provider_name,
                 "model": model,
                 "input": 0,
                 "output": 0,
@@ -2428,12 +2441,163 @@ def _parse_opencode_limit(lines, now):
     return None
 
 
-def opencode_limits(home, now):
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the bearer token can only reach the fixed endpoint host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _opencode_open(request, timeout):
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
+def _opencode_fetch_body(token):
+    request = urllib.request.Request(
+        OPENCODE_USAGE_URL,
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "herdr-control/1.0"},
+        method="GET",
+    )
+    with _opencode_open(request, OPENCODE_USAGE_TIMEOUT) as response:
+        body = response.read(OPENCODE_USAGE_MAX_BYTES + 1)
+    if len(body) > OPENCODE_USAGE_MAX_BYTES:
+        raise ValueError("response too large")
+    return body
+
+
+def _opencode_usage_windows(payload):
+    """Normalize the documented Go usage reply. Any bad field invalidates the body."""
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    windows = {}
+    for api_name, key, minutes in OPENCODE_USAGE_WINDOWS:
+        item = usage.get(api_name)
+        if not isinstance(item, dict):
+            return None
+        status = item.get("status")
+        percent_used = item.get("percent")
+        if status not in ("ok", "rate-limited"):
+            return None
+        if type(percent_used) not in (int, float) or not 0 <= percent_used <= 100:
+            return None
+        reset_text = item.get("resetsAt")
+        if not isinstance(reset_text, str):
+            return None
+        try:
+            resets_at, _ = _parse_iso_to_epoch(reset_text)
+        except (OSError, OverflowError, ValueError):
+            return None
+        if resets_at is None or resets_at <= 0:
+            return None
+        windows[key] = {
+            "remaining": round(100 - float(percent_used), 1),
+            "resets_at": resets_at,
+            "window_minutes": minutes,
+            "status": status,
+        }
+    return windows
+
+
+def _cached_opencode_windows(value, read_at):
+    if not isinstance(value, dict) or not _number(read_at) or read_at <= 0:
+        return None
+    clean = {}
+    for _, key, minutes in OPENCODE_USAGE_WINDOWS:
+        window = value.get(key)
+        if not isinstance(window, dict):
+            return None
+        remaining = window.get("remaining")
+        resets_at = window.get("resets_at")
+        status = window.get("status")
+        if not _number(remaining) or not 0 <= remaining <= 100:
+            return None
+        if not _number(resets_at) or resets_at <= 0:
+            return None
+        if window.get("window_minutes") != minutes or status not in ("ok", "rate-limited"):
+            return None
+        clean[key] = {
+            "remaining": round(float(remaining), 1),
+            "resets_at": resets_at,
+            "window_minutes": minutes,
+            "status": status,
+        }
+    clean["read_at"] = read_at
+    return clean
+
+
+def opencode_usage(cache_dir, now, errors):
+    """Read the live Go quota when the API key is present. Never stores or prints the key."""
+    token = os.environ.get("OPENCODE_GO_API_KEY")
+    if not token or not token.strip():
+        return None
+
+    path = cache_dir / "opencode-usage.json"
+    cached = _read_cache(path)
+    if not isinstance(cached, dict):
+        cached = {}
+    fetched_at = cached.get("fetched_at")
+    checked_at = cached.get("checked_at")
+    windows = _cached_opencode_windows(cached.get("windows"), fetched_at)
+    if _number(checked_at) and 0 <= now - checked_at < OPENCODE_USAGE_INTERVAL:
+        return windows if cached.get("ok", True) else None
+
+    fresh = None
+    try:
+        body = _opencode_fetch_body(token)
+    except urllib.error.HTTPError as exc:
+        errors.append(f"opencode usage: HTTP {int(exc.code)}")
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(exc, (socket.timeout, TimeoutError)) or isinstance(reason, (socket.timeout, TimeoutError)):
+            errors.append("opencode usage: timeout")
+        else:
+            errors.append(f"opencode usage: {type(exc).__name__[:40]}")
+    except ValueError:
+        errors.append("opencode usage: response too large")
+    except Exception as exc:
+        errors.append(f"opencode usage: {type(exc).__name__[:40]}")
+    else:
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            errors.append("opencode usage: invalid response")
+        else:
+            fresh = _opencode_usage_windows(payload)
+            if fresh is None:
+                errors.append("opencode usage: invalid response")
+
+    if fresh is not None:
+        record = _cached_opencode_windows(fresh, now)
+        _write_json_atomic(path, {"fetched_at": now, "checked_at": now, "ok": True, "windows": fresh})
+        return record
+
+    # Record the failed check so the endpoint is not called again within the interval.
+    _write_json_atomic(path, {
+        "fetched_at": fetched_at,
+        "checked_at": now,
+        "ok": False,
+        "windows": cached.get("windows"),
+    })
+    return None
+
+
+def opencode_limits(home, now, cache_dir=None, errors=None):
     path = home / ".local" / "share" / "opencode" / "log" / "opencode.log"
     try:
-        return _parse_opencode_limit(_newest_log_lines(path, OPENCODE_LIMIT_TAIL_BYTES), now)
+        log_limits = _parse_opencode_limit(_newest_log_lines(path, OPENCODE_LIMIT_TAIL_BYTES), now)
     except OSError:
-        return None
+        log_limits = None
+    api_limits = opencode_usage(cache_dir, now, [] if errors is None else errors) if cache_dir is not None else None
+    if api_limits:
+        if log_limits and isinstance(log_limits.get("reached"), dict):
+            api_limits["reached"] = log_limits["reached"]
+        api_limits["source"] = "api"
+        return api_limits
+    return log_limits
 
 
 def _parse_agy_limits(payload, read_at):
@@ -2564,7 +2728,7 @@ def collect_limits(cache_dir, errors, home=None, now=None, *, notes=None):
         "claude": _limit_record(claude.get("claude"), claude["at"]) if claude else None,
         "codex": codex_limits(home, cache_dir, now, notes),
         "antigravity": antigravity,
-        "opencode": opencode_limits(home, now),
+        "opencode": opencode_limits(home, now, cache_dir, errors),
     }
 
 
